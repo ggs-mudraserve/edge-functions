@@ -1,0 +1,145 @@
+// deno-lint-ignore-file no-explicit-any
+// Edge Function – update‑conversation‑status (v1.2)
+// PATCH /update-conversation-status  { conversation_id, new_status, reason? }
+// Implements: dual‑client auth, Zod validation, optimistic locking,
+// stored‑procedure call, structured logging.
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
+import { log, LogLevel } from "../_shared/log.ts";
+
+/*───────────────────────────────
+  ENV & Constants
+──────────────────────────────*/
+const SUPABASE_URL    = Deno.env.get("SUPABASE_URL");
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
+
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  throw new Error("Missing SUPABASE_URL or SUPABASE_ANON_KEY env vars");
+}
+
+/*───────────────────────────────
+  Helpers
+──────────────────────────────*/
+const json = (body: unknown, status = 200, headers: Record<string,string> = {}) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      ...headers,
+    },
+  });
+
+/*───────────────────────────────
+  Validation Schema
+──────────────────────────────*/
+const PatchSchema = z.object({
+  conversation_id : z.string().uuid(),
+  new_status      : z.preprocess(
+                      (v) => typeof v === "string" ? v.toLowerCase() : v,
+                      z.enum(["open", "closed"]),
+                    ),
+  reason          : z.string().trim().max(255).optional(),
+});
+
+/*───────────────────────────────
+  Handler
+──────────────────────────────*/
+serve(async (req: Request) => {
+  const fn = "update-conversation-status";
+  const reqId = crypto.randomUUID();
+  const logger = (evt: string, extra: Record<string, unknown> = {}, level: LogLevel = "info") =>
+    log(evt, { fn, ...extra }, { level, reqId });
+
+  // ─── Method check ──────────────────────────────────────────────
+  if (req.method !== "PATCH") {
+    logger("method_not_allowed", { method: req.method }, "warn");
+    return json({ code: "METHOD_NOT_ALLOWED", message: "Use PATCH" }, 405);
+  }
+
+  // ─── Parse & validate body ────────────────────────────────────
+  let body: z.infer<typeof PatchSchema>;
+  try {
+    const raw = await req.json();
+    const parsed = PatchSchema.safeParse(raw);
+    if (!parsed.success) {
+      logger("bad_request_validation", { issues: parsed.error.flatten() }, "warn");
+      return json({ code: "BAD_REQUEST", message: "Invalid payload", details: parsed.error.flatten() }, 400);
+    }
+    body = parsed.data;
+  } catch (e) {
+    logger("bad_request_json_parse", { error: e?.message }, "warn");
+    return json({ code: "BAD_REQUEST", message: "Invalid JSON payload" }, 400);
+  }
+
+  // ─── Auth header ──────────────────────────────────────────────
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) {
+    logger("auth_header_missing", {}, "warn");
+    return json({ code: "AUTH_REQUIRED", message: "Missing Authorization header" }, 401);
+  }
+
+  // ─── User-scoped Supabase client ──────────────────────────────
+  const supabaseUser: SupabaseClient = createClient(
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false, autoRefreshToken: false } },
+  );
+
+  const { data: { user }, error: userErr } = await supabaseUser.auth.getUser();
+  if (userErr || !user) {
+    logger("auth_invalid_session", { error: userErr?.message }, "warn");
+    return json({ code: "AUTH_INVALID", message: userErr?.message ?? "Invalid session" }, 401);
+  }
+
+  const userRole = (user as any).app_metadata?.role ?? "user";
+  if (["service_role", "supabase_admin", "whatsapp_webhook"].includes(userRole)) {
+    logger("auth_forbidden_role", { userId: user.id, role: userRole }, "warn");
+    return json({ code: "FORBIDDEN_ROLE", message: "Role not allowed" }, 403);
+  }
+
+  // ─── Optimistic locking (If-Match header) ─────────────────────
+  const ifMatch = req.headers.get("If-Match");
+  const version = ifMatch ? parseInt(ifMatch, 10) : null;
+
+  try {
+    logger("rpc_call_attempt", { conversationId: body.conversation_id, newStatus: body.new_status });
+
+    const { data: convo, error: rpcErr } = await supabaseUser.rpc("set_conversation_status", {
+      p_agent_id: user.id,
+      p_convo_id: body.conversation_id,
+      p_target_status: body.new_status,
+      p_reason: body.reason ?? null,
+      p_version: version,
+    });
+
+    if (rpcErr) {
+      // Use hint to map status codes when PostgREST passes them
+      const hint = rpcErr.hint ?? "";
+      if (hint.includes("404")) {
+        logger("rpc_not_found", { msg: rpcErr.message }, "warn");
+        return json({ code: "NOT_FOUND", message: "Conversation not found" }, 404);
+      }
+      if (hint.includes("403")) {
+        logger("rpc_permission_denied", { msg: rpcErr.message }, "warn");
+        return json({ code: "PERMISSION_DENIED", message: "Permission denied" }, 403);
+      }
+      if (rpcErr.message.includes("IDEMPOTENT_NO_CHANGE")) {
+        logger("rpc_idempotent", { conversationId: body.conversation_id });
+        return json({ success: true, message: "No change needed", conversation: convo });
+      }
+      // fallback
+      logger("rpc_error", { msg: rpcErr.message, code: rpcErr.code }, "error");
+      return json({ code: "RPC_ERROR", message: rpcErr.message }, 500);
+    }
+
+    logger("rpc_success", { conversationId: body.conversation_id, newStatus: body.new_status });
+    return json({ success: true, conversation: convo });
+
+  } catch (e: any) {
+    logger("unhandled_exception", { error: e?.message ?? e }, "error");
+    return json({ code: "UNEXPECTED_ERROR", message: "Unexpected error" }, 500);
+  }
+});

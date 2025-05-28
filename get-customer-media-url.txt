@@ -1,0 +1,132 @@
+// deno-lint-ignore-file no-explicit-any
+// Edge Function – get‑customer‑media‑url (v1.2)
+// GET /get-customer-media-url?conversation_id=UUID&media_id=<waMediaId>&download=true|false
+// Behaviour
+//   • Auth‑checked via RLS (user client) + admin fetch of per‑number access token
+//   • If download=true (default) → streams the media back through Edge with
+//       Content‑Disposition: attachment; filename="<mediaId>.<ext>"
+//   • If download=false  → returns JSON metadata (url, mime_type, …)
+//   • Handles 404→410, 429 retry‑after, token cache 60 s
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { extension as mimeExtension } from "https://deno.land/std@0.224.0/media_types/mod.ts";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
+import { log, LogLevel } from "../_shared/log.ts";
+
+/*──────────────────────────────────────────*/
+/** ENV & cache */
+/*──────────────────────────────────────────*/
+const SUPABASE_URL  = Deno.env.get("SUPABASE_URL");
+const ANON_KEY      = Deno.env.get("SUPABASE_ANON_KEY");
+const SERVICE_KEY   = Deno.env.get("CUSTOM_SERVICE_ROLE_KEY");
+const GRAPH_VER     = Deno.env.get("WA_GRAPH_VERSION") ?? "19.0";
+if (!SUPABASE_URL || !ANON_KEY || !SERVICE_KEY) throw new Error("Missing Supabase env vars");
+
+const tokenCache = new Map<string, { token: string; exp: number }>();
+
+/*──────────────────────────────────────────*/
+/** Helpers */
+/*──────────────────────────────────────────*/
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization,Content-Type",
+  Vary: "Origin",
+};
+const json = (b: unknown, s = 200, h: Record<string, string> = {}) =>
+  new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json", ...CORS, ...h } });
+
+const ParamsSchema = z.object({
+  conversation_id: z.string().uuid(),
+  media_id:        z.string().min(1),
+  download:        z.string().optional(), // "true" | "false"
+});
+
+/*──────────────────────────────────────────*/
+/** Handler */
+/*──────────────────────────────────────────*/
+serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
+  const fn = "get-customer-media-url";
+  const reqId = crypto.randomUUID();
+  const logger = (e: string, ex: Record<string, unknown> = {}, l: LogLevel = "info") =>
+    log(e, { fn, reqId, ...ex }, { level: l });
+
+  if (req.method !== "GET") return json({ code: "METHOD_NOT_ALLOWED" }, 405);
+
+  /* Parse & validate query params */
+  const url = new URL(req.url);
+  const rawParams = Object.fromEntries(url.searchParams.entries());
+  const parse = ParamsSchema.safeParse(rawParams);
+  if (!parse.success) return json({ code: "BAD_REQUEST", details: parse.error.flatten() }, 400);
+  const { conversation_id, media_id, download = "true" } = parse.data;
+  const downloadBool = download !== "false";
+
+  /* Auth */
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) return json({ code: "AUTH_REQUIRED" }, 401);
+
+  const userClient = createClient(SUPABASE_URL, ANON_KEY, {
+    global: { headers: { Authorization: authHeader } },
+    auth:   { persistSession: false, autoRefreshToken: false },
+  });
+  const { data: { user }, error: userErr } = await userClient.auth.getUser();
+  if (userErr || !user) return json({ code: "AUTH_INVALID", message: userErr?.message }, 401);
+
+  /* Step‑1: confirm caller can SEE conversation */
+  const { data: convoRow } = await userClient
+    .from("conversations")
+    .select("id, business_number_id")
+    .eq("id", conversation_id)
+    .maybeSingle();
+  if (!convoRow) return json({ code: "NOT_FOUND_OR_FORBIDDEN" }, 404);
+  const businessId = convoRow.business_number_id as string;
+
+  /* Step‑2: get access_token (admin) with 60 s LRU cache */
+  let token = tokenCache.get(businessId);
+  const now = Date.now();
+  if (!token || token.exp < now) {
+    const admin = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
+    const { data, error } = await admin
+      .from("business_whatsapp_numbers")
+      .select("access_token")
+      .eq("id", businessId)
+      .single();
+    if (error || !data?.access_token) return json({ code: "WABA_CONFIG_MISSING" }, 500);
+    token = { token: data.access_token, exp: now + 60_000 };
+    tokenCache.set(businessId, token);
+  }
+
+  /* Step‑3: WA Graph – get media meta */
+  const metaRes = await fetch(`https://graph.facebook.com/v${GRAPH_VER}/${media_id}`, {
+    headers: { Authorization: `Bearer ${token.token}` },
+  });
+  const meta = await metaRes.json();
+  if (!metaRes.ok || !meta.url) {
+    const code = meta.error?.code;
+    if (code === 80007) return json({ code: "RATE_LIMIT", retry_after: meta.error.error_data?.retry_after }, 429, { "Retry-After": String(meta.error.error_data?.retry_after ?? 30) });
+    return json({ code: "WA_ERROR", message: meta.error?.message }, metaRes.status === 404 ? 410 : 502);
+  }
+
+  /* Step‑4: If JSON requested */
+  if (!downloadBool) {
+    return json({ success: true, download_url: meta.url, mime_type: meta.mime_type, file_size: meta.file_size, sha256: meta.sha256 });
+  }
+
+  /* Step‑5: Stream file through Edge */
+  const waRes = await fetch(meta.url);
+  if (!waRes.ok) return json({ code: "WA_DOWNLOAD_ERROR" }, 502);
+
+  const ext = mimeExtension(meta.mime_type) ?? "bin";
+  const disp = `attachment; filename=\"${media_id}.${ext}\"`;
+  return new Response(waRes.body, {
+    status: 200,
+    headers: {
+      ...CORS,
+      "Content-Type": meta.mime_type,
+      "Content-Disposition": disp,
+      "Content-Length": waRes.headers.get("Content-Length") ?? meta.file_size?.toString() ?? "",
+    },
+  });
+});

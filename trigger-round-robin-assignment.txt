@@ -1,0 +1,240 @@
+// supabase/functions/trigger-round-robin-assignment/index.ts
+// deno-lint-ignore-file no-explicit-any
+// Edge Function – trigger-round-robin-assignment (v1.3)
+// POST /trigger-round-robin-assignment (JSON body, optional: { "segment": "segment_value" })
+//
+// • Admin-only action.
+// • Fetches unassigned 'open' conversations, ordered by creation time.
+// • Fetches available agents (active, present_today) for the relevant segment(s),
+//   ordered by last_chat_assigned_at for round-robin.
+// • Assigns conversations in a round-robin fashion within each segment.
+// • Calls 'assign_conversation_and_update_related' RPC for each assignment.
+// • Uses an advisory lock to prevent concurrent runs.
+// • Processes conversations in chunks.
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
+import { log, LogLevel } from "../_shared/log.ts"; // Assuming a shared log utility
+
+/* ─── env ─────────────────────────────────────────── */
+const SUPA_URL = Deno.env.get("SUPABASE_URL");
+const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
+const SERVICE_KEY = Deno.env.get("CUSTOM_SERVICE_ROLE_KEY");
+if (!SUPA_URL || !ANON_KEY || !SERVICE_KEY) throw new Error("Missing env vars (SUPABASE_URL, SUPABASE_ANON_KEY, CUSTOM_SERVICE_ROLE_KEY)");
+
+/* ─── types ───────────────────────────────────────── */
+interface AgentProfile {
+  id: string;
+}
+
+interface FailedAssignment {
+  cid: string; // Conversation ID
+  aid?: string; // Agent ID (if an attempt was made)
+  reason: string;
+}
+
+interface ConversationToAssign {
+  id: string;
+  segment: string;
+  version: number;
+  created_at: string; // Added for clarity, though primarily used for ordering
+}
+
+/* ─── helpers ─────────────────────────────────────── */
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization,Content-Type,Apikey",
+};
+const json = (b: unknown, s = 200, h: Record<string, string> = {}) =>
+  new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json", ...CORS, ...h } });
+
+/* ─── schema ──────────────────────────────────────── */
+const BodySchema = z.object({ segment: z.string().optional() }).optional();
+
+/* ─── handler ─────────────────────────────────────── */
+serve(async (req: Request) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
+
+  const fn = "rr-assign";
+  const reqId = crypto.randomUUID();
+  const logger = (e: string, ex: Record<string, unknown> = {}, lvl: LogLevel = "info") =>
+    log(e, { fn, reqId, ...ex }, { level: lvl });
+
+  if (req.method !== "POST") {
+    logger("method_not_allowed", { method: req.method }, "warn");
+    return json({ code: "METHOD_NOT_ALLOWED", message: "Method must be POST." }, 405);
+  }
+
+  /* auth */
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) {
+    logger("auth_header_missing", {}, "warn");
+    return json({ code: "AUTH_REQUIRED", message: "Missing Authorization header." }, 401);
+  }
+
+  const userClient = createClient(SUPA_URL!, ANON_KEY!,
+    { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false } });
+  const { data: { user }, error: authErr } = await userClient.auth.getUser();
+  if (authErr || !user) {
+    logger("auth_invalid_user", { error: authErr?.message }, "warn");
+    return json({ code: "AUTH_INVALID", message: "Invalid user session." }, 401);
+  }
+
+  /* admin check (service role) */
+  const service = createClient(SUPA_URL!, SERVICE_KEY!, { auth: { persistSession: false } });
+  const { data: profile, error: profileErr } = await service.from("profile").select("role").eq("id", user.id).single();
+
+  if (profileErr) {
+    logger("profile_fetch_error", { userId: user.id, error: profileErr.message }, "error");
+    return json({ code: "PROFILE_ERROR", message: "Error fetching user profile for role check." }, 500);
+  }
+  if (profile?.role !== "admin") {
+    logger("auth_forbidden_not_admin", { userId: user.id, role: profile?.role || "unknown" }, "warn");
+    return json({ code: "FORBIDDEN_ROLE", message: "Only Admins can trigger round-robin assignment." }, 403);
+  }
+  logger("admin_verified", { adminId: user.id });
+
+  /* request body */
+  let targetSegment: string | undefined;
+  if (req.headers.get("content-type")?.includes("application/json")) {
+    try {
+      const rawBody = await req.text();
+      if (rawBody) {
+        const body = JSON.parse(rawBody);
+        const parsed = BodySchema.safeParse(body);
+        if (!parsed.success) {
+          logger("bad_request_payload", { error: parsed.error.flatten() }, "warn");
+          return json({ code: "BAD_REQUEST", message: "Invalid request payload.", details: parsed.error.flatten() }, 400);
+        }
+        targetSegment = parsed.data?.segment;
+      }
+    } catch(e) {
+      logger("bad_request_json_parse", { error: e?.message }, "warn");
+      return json({ code: "BAD_REQUEST", message: "Invalid JSON in payload." }, 400);
+    }
+  }
+
+  if (targetSegment) {
+    logger("processing_segment_filter", { segment: targetSegment });
+  } else {
+    logger("processing_all_segments");
+  }
+
+  /* ── advisory lock – one run at a time ── */
+  const ADVISORY_LOCK_KEY = 42;
+  const { data: lockAcquired, error: lockError } = await service.rpc("pg_try_advisory_xact_lock", { key: ADVISORY_LOCK_KEY });
+
+  if (lockError) {
+    logger("advisory_lock_rpc_error", { error: lockError.message }, "error");
+    return json({ code: "LOCK_ERROR", message: "Failed to attempt advisory lock." }, 500);
+  }
+
+  if (!lockAcquired) {
+    logger("advisory_lock_not_acquired", { key: ADVISORY_LOCK_KEY }, "info");
+    return json({ code: "RUNNING_ELSEWHERE", message: "Another round-robin assignment run is currently active. Please try again later." }, 429);
+  }
+  logger("advisory_lock_acquired", { key: ADVISORY_LOCK_KEY });
+
+
+  /* agent cache by segment */
+  const agentCache = new Map<string, { list: AgentProfile[]; idx: number }>();
+
+  /* results */
+  let assignedCount = 0;
+  const failedAssignments: FailedAssignment[] = [];
+
+  /* process in chunks */
+  let moreConversationsToProcess = true;
+  const CHUNK_SIZE = 200;
+
+  try {
+    while (moreConversationsToProcess) {
+      let conversationsQuery = service.from("conversations")
+        .select("id, segment, version, created_at") // Selecting created_at for ordering
+        .eq("status", "open")
+        .is("assigned_agent_id", null)
+        .order("created_at", { ascending: true }) // *** CORRECTED: Use created_at ***
+        .limit(CHUNK_SIZE);
+
+      if (targetSegment) {
+        conversationsQuery = conversationsQuery.eq("segment", targetSegment);
+      }
+
+      const { data: conversationsInChunk, error: convosError } = await conversationsQuery as { data: ConversationToAssign[] | null, error: any };
+
+      if (convosError) {
+        logger("fetch_conversations_failed", { error: convosError.message }, "error");
+        return json({ code: "DB_ERROR", message: "Failed to fetch unassigned conversations." }, 500);
+      }
+
+      if (!conversationsInChunk || conversationsInChunk.length === 0) {
+        moreConversationsToProcess = false;
+        continue;
+      }
+      moreConversationsToProcess = conversationsInChunk.length === CHUNK_SIZE;
+
+      for (const convo of conversationsInChunk) {
+        let segmentAgentCache = agentCache.get(convo.segment);
+        if (!segmentAgentCache) {
+          const { data: agents, error: agentsError } = await service.from("profile")
+            .select("id")
+            .in("role", ["agent", "team_leader"])
+            .eq("is_active", true)
+            .eq("present_today", true)
+            .eq("segment", convo.segment)
+            .order("last_chat_assigned_at", { ascending: true, nullsFirst: true });
+
+          if (agentsError) {
+            logger("fetch_agents_failed", { segment: convo.segment, error: agentsError.message }, "warn");
+            failedAssignments.push({ cid: convo.id, reason: `Failed to fetch agents for segment ${convo.segment}: ${agentsError.message}` });
+            continue;
+          }
+          segmentAgentCache = { list: agents || [], idx: 0 };
+          agentCache.set(convo.segment, segmentAgentCache);
+        }
+
+        if (!segmentAgentCache.list.length) {
+          logger("no_available_agents_for_segment", { conversationId: convo.id, segment: convo.segment });
+          failedAssignments.push({ cid: convo.id, reason: `No available agents in segment ${convo.segment}` });
+          continue;
+        }
+
+        const agentToAssign = segmentAgentCache.list[segmentAgentCache.idx];
+        segmentAgentCache.idx = (segmentAgentCache.idx + 1) % segmentAgentCache.list.length;
+
+        const { error: rpcError } = await service.rpc("assign_conversation_and_update_related", {
+          p_actor_id: user.id,
+          p_conversation_id: convo.id,
+          p_new_assignee_id: agentToAssign.id,
+          p_reason: "round-robin",
+          p_version: convo.version,
+        });
+
+        if (rpcError) {
+          logger("rpc_assign_failed", { conversationId: convo.id, agentId: agentToAssign.id, error: rpcError.message, details: rpcError.details }, "error");
+          failedAssignments.push({ cid: convo.id, aid: agentToAssign.id, reason: rpcError.message });
+        } else {
+          assignedCount++;
+        }
+      }
+    }
+
+    logger("assignment_process_complete", { assignedCount, failedCount: failedAssignments.length, segment: targetSegment });
+    return json({
+      success: true,
+      assigned_count: assignedCount,
+      failed_count: failedAssignments.length,
+      ...(failedAssignments.length > 0 && { failed_details: failedAssignments.slice(0, 1000) }),
+    });
+
+  } catch (e) {
+    logger("unhandled_exception_in_main_logic", { error: e?.message, stack: e?.stack }, "error");
+    return json({ code: "UNEXPECTED_ERROR", message: "An unexpected server error occurred during assignment." }, 500);
+  } finally {
+    // Transactional advisory locks (pg_try_advisory_xact_lock) are automatically released
+    // at the end of the transaction, which in an Edge Function context is typically
+    // when the function execution completes or the database client session ends.
+  }
+});

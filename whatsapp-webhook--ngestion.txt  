@@ -1,0 +1,340 @@
+// supabase/functions/whatsapp-webhook-ingestion/index.ts
+
+import { serve } from 'https://deno.land/std@0.177.0/http/server.ts'; // Using a common older version for std modules, update if needed
+import { createClient, SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2';
+// Removed: import { HmacSha256 } from 'https://deno.land/std@0.177.0/hash/sha256.ts'; // This was causing module not found
+import { equals } from 'https://deno.land/std@0.177.0/crypto/timing_safe_equal.ts'; // Keep this, update version if it also causes issues
+
+// --- Interfaces (remains the same) ---
+interface WhatsAppMessage {
+  from: string;
+  id: string;
+  timestamp: string; // Unix timestamp (seconds) string
+  type: 'text' | 'image' | 'document' | 'audio' | 'video' | 'sticker' | 'location' | 'contacts' | 'interactive' | 'button' | 'system' | 'unknown' | 'order';
+  text?: { body: string };
+  image?: WhatsAppMedia;
+  document?: WhatsAppMedia & { filename?: string };
+  audio?: WhatsAppMedia;
+  video?: WhatsAppMedia;
+  sticker?: WhatsAppMedia;
+  interactive?: WhatsAppInteractiveMessage;
+  button?: WhatsAppButtonMessage;
+  system?: WhatsAppSystemMessage;
+}
+interface WhatsAppMedia { id: string; mime_type: string; sha256?: string; caption?: string; }
+interface WhatsAppInteractiveMessage { type: 'list_reply' | 'button_reply'; list_reply?: { id: string; title: string; description?: string; }; button_reply?: { id: string; title: string; };}
+interface WhatsAppButtonMessage { payload: string; text: string; }
+interface WhatsAppSystemMessage { body: string; type: string; }
+interface WhatsAppContact { profile: { name: string }; wa_id: string; }
+interface WhatsAppMetadata { display_phone_number: string; phone_number_id: string; }
+interface WhatsAppValue { messaging_product: 'whatsapp'; metadata: WhatsAppMetadata; contacts?: WhatsAppContact[]; messages?: WhatsAppMessage[]; statuses?: any[]; }
+interface WhatsAppChange { value: WhatsAppValue; field: 'messages'; }
+interface WhatsAppEntry { id: string; changes: WhatsAppChange[]; }
+interface WebhookPayload { object: 'whatsapp_business_account'; entry: WhatsAppEntry[]; }
+
+// --- Supabase Client and Error Logging ---
+let supabaseAdmin: SupabaseClient | null = null;
+
+function getSupabaseAdminClient(): SupabaseClient {
+  if (supabaseAdmin) return supabaseAdmin;
+
+  const supabaseUrl = Deno.env.get('SUPABASE_URL'); // Automatically injected
+  const supabaseServiceRoleKey = Deno.env.get('CUSTOM_SERVICE_ROLE_KEY'); // Use your custom-named secret
+
+  if (!supabaseUrl) {
+    console.error('CRITICAL: SUPABASE_URL is not available in environment variables.');
+    throw new Error('SUPABASE_URL is not available.');
+  }
+  if (!supabaseServiceRoleKey) {
+    console.error('CRITICAL: CUSTOM_SERVICE_ROLE_KEY must be set in Edge Function secrets.');
+    throw new Error('CUSTOM_SERVICE_ROLE_KEY must be set.');
+  }
+
+  if (!supabaseUrl.includes('.supabase.co') && !supabaseUrl.includes('localhost')) {
+      console.warn('Potential SUPABASE_URL misconfiguration (automatically injected).');
+  }
+  if (!supabaseServiceRoleKey.startsWith('ey') && !supabaseServiceRoleKey.startsWith('service_')) {
+      console.warn('Potential CUSTOM_SERVICE_ROLE_KEY format misconfiguration.');
+  }
+
+  supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey, {
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
+  return supabaseAdmin;
+}
+
+async function logErrorToDb(source: string, message: string, details?: object, userId?: string, errorCode?: string) {
+  try {
+    const client = getSupabaseAdminClient();
+    const { error } = await client.from('application_error_logs').insert({
+      error_source: source,
+      error_message: message,
+      details: details || {},
+      user_id: userId,
+      error_code: errorCode,
+    });
+    if (error) {
+      console.error('Failed to log error to DB:', error.message);
+    }
+  } catch (dbLogErr) {
+    console.error('CRITICAL: Exception during DB error logging:', dbLogErr);
+  }
+}
+
+const VALID_MESSAGE_CONTENT_TYPES = [
+  'text', 'image', 'document', 'audio', 'video', 'sticker',
+  'location', 'contacts', 'interactive', 'button', 'system', 'order', 'unknown'
+];
+
+function getSafeMessageType(originalType: string): string {
+  if (VALID_MESSAGE_CONTENT_TYPES.includes(originalType)) {
+    return originalType;
+  }
+  console.warn(`Received unknown or unmapped message type from WhatsApp: ${originalType}. Defaulting to 'unknown'.`);
+  return 'unknown';
+}
+
+
+serve(async (req: Request) => {
+  const functionSource = 'whatsapp-webhook-ingestion';
+
+  try {
+    getSupabaseAdminClient();
+  } catch (initError) {
+    console.error('Failed to initialize Supabase client:', initError.message);
+    return new Response(JSON.stringify({ status: 'error', message: 'Internal Server Configuration Error.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  if (req.method === 'GET') {
+    try {
+      const url = new URL(req.url);
+      const hubMode = url.searchParams.get('hub.mode');
+      const hubChallenge = url.searchParams.get('hub.challenge');
+      const hubVerifyToken = url.searchParams.get('hub.verify_token');
+      const WHATSAPP_VERIFY_TOKEN = Deno.env.get('WHATSAPP_VERIFY_TOKEN');
+
+      if (!WHATSAPP_VERIFY_TOKEN) {
+        console.error('WHATSAPP_VERIFY_TOKEN is not set.');
+        await logErrorToDb(functionSource, 'WHATSAPP_VERIFY_TOKEN not set', { stage: 'GET verification' }, undefined, 'CONFIG_ERROR');
+        return new Response('Internal configuration error.', { status: 500 });
+      }
+      if (hubMode === 'subscribe' && hubVerifyToken === WHATSAPP_VERIFY_TOKEN) {
+        console.log('Webhook verified successfully with Meta.');
+        return new Response(hubChallenge, { status: 200 });
+      } else {
+        console.warn('Webhook verification failed. Tokens/mode mismatch.');
+        await logErrorToDb(functionSource, 'Webhook verification failed', { hubMode, hasVerifyToken: !!hubVerifyToken }, undefined, 'AUTH_FAILURE');
+        return new Response('Failed validation.', { status: 403 });
+      }
+    } catch (error) {
+      console.error('Error during GET verification:', error.message);
+      await logErrorToDb(functionSource, 'Exception during GET verification', { error: error.message, stack: error.stack }, undefined, 'GET_EXCEPTION');
+      return new Response('Error during verification.', { status: 500 });
+    }
+  }
+
+  if (req.method === 'POST') {
+    let rawBody: string;
+    try {
+      rawBody = await req.text();
+    } catch (bodyReadError) {
+        console.error('Failed to read request body:', bodyReadError.message);
+        await logErrorToDb(functionSource, 'Failed to read request body', { error: bodyReadError.message }, undefined, 'BODY_READ_FAIL');
+        return new Response(JSON.stringify({ status: 'error', message: 'Could not read request body.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    const signatureHeader = req.headers.get('X-Hub-Signature-256');
+    const appSecret = Deno.env.get('WHATSAPP_APP_SECRET');
+
+    if (!appSecret) {
+      console.error('CRITICAL: WHATSAPP_APP_SECRET is not set.');
+      await logErrorToDb(functionSource, 'WHATSAPP_APP_SECRET not set', { stage: 'POST signature check' }, undefined, 'CONFIG_ERROR_CRITICAL');
+      return new Response(JSON.stringify({ status: 'error', message: 'Internal Server Configuration Error (Signature).' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    if (!signatureHeader || !signatureHeader.startsWith('sha256=')) {
+      console.warn('Missing or malformed X-Hub-Signature-256 header.');
+      await logErrorToDb(functionSource, 'Missing or malformed X-Hub-Signature-256', { headers: Object.fromEntries(req.headers.entries()) }, undefined, 'AUTH_MISSING_SIG');
+      return new Response(JSON.stringify({ status: 'error', message: 'Missing or malformed signature.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    try {
+        // Use Web Crypto API for HMAC SHA256
+        const key = await crypto.subtle.importKey(
+            "raw",
+            new TextEncoder().encode(appSecret),
+            { name: "HMAC", hash: "SHA-256" },
+            false,
+            ["sign"]
+        );
+        const signatureBuffer = await crypto.subtle.sign(
+            "HMAC",
+            key,
+            new TextEncoder().encode(rawBody)
+        );
+        const expectedHash = Array.from(new Uint8Array(signatureBuffer))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join('');
+
+        const signatureHash = signatureHeader.substring(7); // Remove 'sha256=' prefix
+
+        const sigBuffer = new TextEncoder().encode(signatureHash);
+        const expectedBuffer = new TextEncoder().encode(expectedHash);
+        
+        if (!equals(sigBuffer, expectedBuffer)) { // timingSafeEqual
+            console.warn('Invalid X-Hub-Signature-256. Request denied.');
+            await logErrorToDb(functionSource, 'Invalid X-Hub-Signature-256', { received: signatureHeader, calculatedHash: expectedHash }, undefined, 'AUTH_INVALID_SIG');
+            return new Response(JSON.stringify({ status: 'error', message: 'Invalid signature.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+    } catch (sigError) {
+        console.error('Error during signature verification:', sigError.message);
+        await logErrorToDb(functionSource, 'Exception during signature verification', { error: sigError.message, stack: sigError.stack }, undefined, 'SIG_VERIFY_EXCEPTION');
+        return new Response(JSON.stringify({ status: 'error', message: 'Error verifying signature.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    let requestBody: WebhookPayload;
+    try {
+      requestBody = JSON.parse(rawBody);
+      if (requestBody.object !== 'whatsapp_business_account' || !requestBody.entry || requestBody.entry.length === 0) {
+        console.warn('Invalid webhook payload structure:', requestBody);
+        await logErrorToDb(functionSource, 'Invalid payload structure', { payload: requestBody }, undefined, 'INVALID_PAYLOAD');
+        return new Response(JSON.stringify({ status: 'error', message: 'Invalid payload structure.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+    } catch (error) {
+      console.error('Error parsing JSON body:', error.message);
+      await logErrorToDb(functionSource, 'JSON parsing error', { error: error.message }, undefined, 'JSON_PARSE_FAIL');
+      return new Response(JSON.stringify({ status: 'error', message: 'Bad Request: Could not parse JSON.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    const processingPromises = requestBody.entry.flatMap(entry =>
+      entry.changes.flatMap(change => { 
+        if (change.field === 'messages' && change.value.messages && change.value.messages.length > 0) {
+          return change.value.messages.map(async (messageData) => {
+            const contacts = change.value.contacts; 
+            const metadata = change.value.metadata; 
+
+            if (!metadata) { 
+              console.warn('Webhook change missing metadata:', JSON.stringify(change.value));
+              await logErrorToDb(functionSource, 'Missing metadata in change value', { changeValue: change.value, messageId: messageData.id }, undefined, 'DATA_MISSING_METADATA');
+              return { status: 'skipped', messageId: messageData.id, reason: 'Missing metadata' };
+            }
+
+            const wabaPhoneNumberId = metadata.phone_number_id;
+            const customerE164Phone = messageData.from;
+            const customerName = contacts?.find(c => c.wa_id === customerE164Phone)?.profile?.name || 'Customer';
+            const messageTimestampNumeric = parseInt(messageData.timestamp);
+
+            const safeMessageTypeForDb = getSafeMessageType(messageData.type);
+            
+            let textContent = messageData.text?.body;
+            let mediaId: string | undefined;
+            let mediaMimeType: string | undefined;
+            let mediaFilename: string | undefined;
+
+            if (['image', 'document', 'audio', 'video', 'sticker'].includes(messageData.type)) {
+              const media = messageData[messageData.type as 'image' | 'document' | 'audio' | 'video' | 'sticker'];
+              if (media) {
+                mediaId = media.id;
+                mediaMimeType = media.mime_type;
+                if ('filename' in media && media.filename) mediaFilename = media.filename;
+                if ('caption' in media && media.caption) textContent = media.caption;
+              }
+            } else if (messageData.type === 'interactive' && messageData.interactive) {
+              if (messageData.interactive.type === 'button_reply' && messageData.interactive.button_reply) {
+                textContent = `Button: ${messageData.interactive.button_reply.title}`;
+              } else if (messageData.interactive.type === 'list_reply' && messageData.interactive.list_reply) {
+                textContent = `List: ${messageData.interactive.list_reply.title}`;
+              } else { textContent = `Interactive: ${messageData.interactive.type}`; }
+            } else if (messageData.type === 'button' && messageData.button) {
+              textContent = `Button Clicked: ${messageData.button.text} (Payload: ${messageData.button.payload})`;
+            } else if (messageData.type === 'system' && messageData.system) {
+              textContent = messageData.system.body;
+            }
+
+            try {
+              const { data: rpcResult, error: rpcError } = await getSupabaseAdminClient().rpc('handle_whatsapp_message', {
+                p_waba_phone_number_id: wabaPhoneNumberId,
+                p_customer_e164_phone: customerE164Phone,
+                p_customer_name: customerName,
+                p_whatsapp_message_id: messageData.id,
+                p_message_type: safeMessageTypeForDb,
+                p_text_content: textContent,
+                p_message_timestamp_epoch: messageTimestampNumeric,
+                p_media_id: mediaId,
+                p_media_mime_type: mediaMimeType,
+                p_media_filename: mediaFilename,
+              });
+
+              if (rpcError) {
+                console.error(`RPC handle_whatsapp_message error for ${messageData.id}:`, rpcError.message);
+                await logErrorToDb(functionSource, 'RPC handle_whatsapp_message error', { error: rpcError, messageId: messageData.id }, undefined, 'RPC_ERROR');
+                return { status: 'failed', messageId: messageData.id, reason: `RPC Error: ${rpcError.message}` };
+              }
+              
+              if (!rpcResult || rpcResult.status !== 'success') {
+                  console.error(`RPC handle_whatsapp_message did not succeed for ${messageData.id}:`, rpcResult?.error_message || 'Unknown RPC failure');
+                  await logErrorToDb(functionSource, 'RPC handle_whatsapp_message non-success', { result: rpcResult, messageId: messageData.id }, undefined, 'RPC_NON_SUCCESS');
+                  return { status: 'failed', messageId: messageData.id, reason: rpcResult?.error_message || 'RPC non-success status' };
+              }
+
+              if (rpcResult.chatbot_endpoint_url && rpcResult.is_chatbot_active) {
+                const chatbotPayload = {
+                  original_whatsapp_message: messageData,
+                  contact_phone: customerE164Phone,
+                  business_waba_id: entry.id, 
+                  business_phone_id: wabaPhoneNumberId, 
+                  internal_conversation_id: rpcResult.conversation_id,
+                  internal_lead_id: rpcResult.lead_id,
+                  chatbot_identifier: rpcResult.chatbot_identifier,
+                  customer_name: customerName,
+                };
+                console.log(`Forwarding to chatbot: ${rpcResult.chatbot_endpoint_url} for conv ${rpcResult.conversation_id}, msg ${messageData.id}`);
+                
+                fetch(rpcResult.chatbot_endpoint_url, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Source': functionSource },
+                  body: JSON.stringify(chatbotPayload),
+                })
+                .then(async response => {
+                  if (!response.ok) {
+                    const errorText = await response.text().catch(() => "Could not read chatbot error text");
+                    console.error(`Chatbot endpoint error (${rpcResult.chatbot_endpoint_url}) for msg ${messageData.id}: ${response.status} ${response.statusText}. Resp: ${errorText}`);
+                    await logErrorToDb(functionSource, 'Chatbot endpoint error', {
+                      endpoint: rpcResult.chatbot_endpoint_url, status: response.status, errorText, conversationId: rpcResult.conversation_id, messageId: messageData.id
+                    }, undefined, 'CHATBOT_ERROR');
+                  } else {
+                    console.log(`Successfully forwarded message ${messageData.id} to chatbot.`);
+                  }
+                })
+                .catch(async (err) => {
+                  console.error(`Error calling chatbot endpoint (${rpcResult.chatbot_endpoint_url}) for msg ${messageData.id}:`, err.message || err);
+                  await logErrorToDb(functionSource, 'Chatbot fetch exception', {
+                      endpoint: rpcResult.chatbot_endpoint_url, error: err.message, conversationId: rpcResult.conversation_id, messageId: messageData.id
+                  }, undefined, 'CHATBOT_EXCEPTION');
+                });
+              }
+              return { status: 'success', messageId: messageData.id };
+            } catch (procError) {
+              console.error(`Error processing message ${messageData.id}:`, procError.message);
+              await logErrorToDb(functionSource, 'Exception during individual message processing', { error: procError.message, stack: procError.stack, messageId: messageData.id }, undefined, 'PROC_MSG_EXCEPTION');
+              return { status: 'failed', messageId: messageData.id, reason: `Processing Exception: ${procError.message}` };
+            }
+          }); 
+        } else if (change.field === 'messages' && change.value.statuses && change.value.statuses.length > 0) {
+          return Promise.resolve({ status: 'skipped', reason: 'Status update' }); 
+        }
+        return Promise.resolve({ status: 'skipped', reason: 'Not a processable message change' }); 
+      })
+    );
+
+    await Promise.allSettled(processingPromises.flat()); 
+
+    return new Response(JSON.stringify({ status: 'success', message: 'Webhook received and processing initiated.' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  console.warn(`Unsupported method: ${req.method}`);
+  return new Response(JSON.stringify({status: 'error', message: 'Unsupported method.'}), { status: 405, headers: { 'Content-Type': 'application/json' } });
+})

@@ -1,0 +1,119 @@
+// deno-lint-ignore-file no-explicit-any
+// Edge Function – upload‑chat‑media (v1.3)
+// POST /upload-chat-media  (multipart/form‑data, field = "file")
+// * Authenticated agent / TL / admin uploads media to **public** `whatsapp` bucket
+// * Guards: max‑10 MB, allow‑listed MIME types incl. Office docs
+// * Storage path: DDMMYYYY/<uploaderUid>/<slugFilename>-<uuid>.<ext>
+// * Returns permanent public URL (bucket is public) + metadata
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient, SupabaseClient, SupabaseClientOptions } from "https://esm.sh/@supabase/supabase-js@2";
+import { extension as mimeExtension } from "https://deno.land/std@0.224.0/media_types/mod.ts";
+import { log, LogLevel } from "../_shared/log.ts";
+
+/*────────────────────────────────────────────────────*/
+/** ENV & constants */
+/*────────────────────────────────────────────────────*/
+const SUPABASE_URL        = Deno.env.get("SUPABASE_URL");
+const PUBLIC_ANON_KEY     = Deno.env.get("SUPABASE_ANON_KEY");
+if (!SUPABASE_URL || !PUBLIC_ANON_KEY) throw new Error("Missing Supabase env vars");
+
+const STORAGE_BUCKET = "whatsapp";            // public bucket
+const MAX_FILE_BYTES = 10 * 1024 * 1024;       // 10 MB
+const ALLOWED_MIME: Record<string, string> = {
+  // images
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  // pdf
+  "application/pdf": "pdf",
+  // office legacy + OOXML
+  "application/msword": "doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  "application/vnd.ms-excel": "xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+  "application/vnd.ms-powerpoint": "ppt",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+};
+
+/*────────────────────────────────────────────────────*/
+/** Helpers */
+/*────────────────────────────────────────────────────*/
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization,Content-Type",
+  Vary: "Origin",
+};
+const json = (b: unknown, s = 200, h: Record<string, string> = {}) =>
+  new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json", ...CORS, ...h } });
+
+function slugify(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+}
+
+/*────────────────────────────────────────────────────*/
+/** Handler */
+/*────────────────────────────────────────────────────*/
+serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
+
+  const fn = "upload-chat-media";
+  const reqId = crypto.randomUUID();
+  const logger = (evt: string, extra: Record<string, unknown> = {}, lvl: LogLevel = "info") =>
+    log(evt, { fn, reqId, ...extra }, { level: lvl });
+
+  if (req.method !== "POST") return json({ code: "METHOD_NOT_ALLOWED" }, 405);
+
+  const auth = req.headers.get("Authorization");
+  if (!auth) return json({ code: "AUTH_REQUIRED" }, 401);
+
+  const userClient: SupabaseClient = createClient(SUPABASE_URL!, PUBLIC_ANON_KEY!, {
+    global: { headers: { Authorization: auth } },
+    auth: { persistSession: false, autoRefreshToken: false },
+  } as SupabaseClientOptions);
+
+  const { data: { user }, error: userErr } = await userClient.auth.getUser();
+  if (userErr || !user) return json({ code: "AUTH_INVALID" }, 401);
+
+  const role = (user as any).app_metadata?.role ?? "user";
+  if (!["agent", "team_leader", "admin"].includes(role)) return json({ code: "FORBIDDEN_ROLE" }, 403);
+
+  const form = await req.formData();
+  const file = form.get("file") as File | null;
+  if (!file) return json({ code: "BAD_REQUEST", message: "File not provided" }, 400);
+
+  // Size guard
+  if (file.size > MAX_FILE_BYTES) return json({ code: "FILE_TOO_LARGE", max: MAX_FILE_BYTES }, 413);
+
+  // MIME guard
+  const extFromMime = ALLOWED_MIME[file.type] ?? mimeExtension(file.type);
+  if (!extFromMime) return json({ code: "UNSUPPORTED_MEDIA", mime: file.type }, 415);
+
+  // Storage path construction
+  const d = new Date();
+  const datePath = `${String(d.getUTCDate()).padStart(2, "0")}${String(d.getUTCMonth() + 1).padStart(2, "0")}${d.getUTCFullYear()}`;
+  const baseName = slugify(file.name.split(".")[0]) || "file";
+  const objectName = `${baseName}-${crypto.randomUUID()}.${extFromMime}`;
+  const path = `${datePath}/${user.id}/${objectName}`;
+
+  logger("upload_attempt", { uid: user.id, mime: file.type, size: file.size, path });
+
+  // TODO: virus scan hook here (clamav, cloud‑av, etc.)
+
+  const { data: upRes, error: upErr } = await userClient.storage
+    .from(STORAGE_BUCKET)
+    .upload(path, file, { contentType: file.type, upsert: false, cacheControl: "3600" });
+
+  if (upErr) {
+    logger("storage_upload_error", { err: upErr.message, path }, "error");
+    const status = upErr.statusCode ?? 500;
+    return json({ code: "STORAGE_UPLOAD_FAILED", message: upErr.message }, status);
+  }
+
+  const { data: url } = userClient.storage.from(STORAGE_BUCKET).getPublicUrl(upRes.path);
+
+  logger("upload_success", { uid: user.id, path, url: url.publicUrl });
+  return json({ success: true, media_url: url.publicUrl, path, mime: file.type, size: file.size });
+});

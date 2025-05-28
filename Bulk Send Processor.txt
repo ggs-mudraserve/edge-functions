@@ -1,0 +1,388 @@
+// supabase/functions/bulk-send-processor/index.ts
+
+import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
+import { createClient, SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+const MAX_MESSAGES_PER_INVOCATION = 50;
+const MAX_RETRIES = 3;
+const RETRY_BACKOFF_SECONDS = [15, 60, 300];
+const RATE_ADAPTATION_INTERVAL_SECONDS = 30;
+const RATE_ADAPTATION_INCREMENT_MPS = 1.0;
+const RATE_LIMIT_ERROR_CODE_WHATSAPP = [429, 471];
+
+interface MessageQueueItem {
+  id: string;
+  bulk_send_id: string;
+  recipient_e164_phone: string;
+  template_variables_used: any | null;
+  image_url: string | null;
+  status: 'pending' | 'processing' | 'retry_queued';
+  attempt_count: number;
+  last_attempt_at: string | null;
+  next_attempt_at: string | null;
+  created_at: string;
+  template_name?: string;
+  template_components_json?: any;
+  template_language?: string;
+  waba_phone_number_id_to_send_from?: string;
+  business_whatsapp_number_db_id?: string;
+}
+
+interface BusinessRateLimitParams {
+  id: string;
+  current_mps_target: number;
+  mps_target_updated_at: string | null;
+  is_rate_capped_today: boolean;
+  waba_phone_number_id: string;
+}
+
+let supabaseAdmin: SupabaseClient | null = null;
+
+function getSupabaseAdminClient(): SupabaseClient {
+  if (supabaseAdmin) return supabaseAdmin;
+  const supabaseUrl = Deno.env.get('SUPABASE_URL');
+  const supabaseServiceRoleKey = Deno.env.get('CUSTOM_SERVICE_ROLE_KEY');
+
+  if (!supabaseUrl || !supabaseServiceRoleKey) {
+    throw new Error('SUPABASE_URL and CUSTOM_SERVICE_ROLE_KEY must be set.');
+  }
+  supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey, {
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
+  return supabaseAdmin;
+}
+
+async function logErrorToDb(source: string, message: string, details?: object, errorCode?: string) {
+  try {
+    const client = getSupabaseAdminClient();
+    await client.from('application_error_logs').insert({
+      error_source: source, error_message: message, details: details || {}, error_code: errorCode,
+    });
+  } catch (dbLogErr) { console.error('CRITICAL: Exception during DB error logging:', dbLogErr); }
+}
+
+async function sendWhatsAppMessage(
+  phoneNumberId: string,
+  recipientE164: string,
+  templateName: string,
+  languageCode: string,
+  componentsJson: any, // This is the components array from your template cache
+  templateVariables: any | null, // This is from message_queue.template_variables_used
+  headerImageUrl?: string | null
+): Promise<{ success: boolean; message_id?: string; error_code?: number; error_message?: string }> {
+  const WHATSAPP_API_TOKEN = Deno.env.get('WHATSAPP_API_TOKEN');
+  if (!WHATSAPP_API_TOKEN) {
+    await logErrorToDb('BulkSendProcessor', 'WHATSAPP_API_TOKEN not set');
+    return { success: false, error_message: 'WhatsApp API Token not configured.' };
+  }
+
+  const apiUrl = `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`;
+  const processedComponents: any[] = [];
+
+  if (componentsJson && Array.isArray(componentsJson)) {
+    componentsJson.forEach(originalComponent => {
+      // Create a copy to modify. Note that this is a shallow copy.
+      // If originalComponent has nested objects that also need modification, deeper cloning might be needed.
+      const newComponent = { ...originalComponent };
+
+      let parametersSet = false; // Flag to track if parameters were added to this component
+
+      if (newComponent.type === 'HEADER') {
+        if (newComponent.format === 'IMAGE' && headerImageUrl) {
+          newComponent.parameters = [{ type: 'image', image: { link: headerImageUrl } }];
+          parametersSet = true;
+          delete newComponent.example; // Often headers have 'example' payload, remove if params are set
+        } else if (newComponent.format === 'TEXT' && templateVariables && templateVariables.header && templateVariables.header.length > 0) {
+          newComponent.parameters = templateVariables.header.map((text: string) => ({ type: 'text', text }));
+          parametersSet = true;
+        }
+        // Add similar handling for DOCUMENT, VIDEO if they can have variables
+      } else if (newComponent.type === 'BODY' && templateVariables && templateVariables.body && templateVariables.body.length > 0) {
+        newComponent.parameters = templateVariables.body.map((text: string) => ({ type: 'text', text }));
+        parametersSet = true;
+      } else if (newComponent.type === 'BUTTONS' && newComponent.buttons && Array.isArray(newComponent.buttons)) {
+        // Parameters for buttons modify the individual button objects within the 'buttons' array
+        // The 'parameters' key is not typically added at the top level of a 'BUTTONS' component.
+        // Instead, variable substitution happens within the button's URL or text.
+        newComponent.buttons = newComponent.buttons.map((buttonDef: any, btnIdx: number) => {
+          const newButtonDef = { ...buttonDef }; // Copy button definition
+          if (templateVariables && templateVariables.buttons) {
+              // Find the variable for this specific button by index
+              // Assuming templateVariables.buttons is an array like [{ index: "0", sub_type: "url", parameter: "dynamic_value" }]
+              const buttonVar = templateVariables.buttons.find((v: any) => parseInt(String(v.index)) === btnIdx);
+
+              if (buttonVar && buttonDef.type === 'URL' && buttonDef.sub_type === 'url' && buttonDef.url && typeof buttonVar.parameter === 'string') {
+                  // Replace placeholder in URL. Common placeholders {{1}}, [[1]]
+                  // This assumes the template has ONE variable placeholder in the button URL.
+                  // If there are multiple, this logic needs to be more sophisticated.
+                  newButtonDef.url = buttonDef.url.replace(/\{\{1\}\}|\[\[1\]\]/g, buttonVar.parameter);
+                  // Note: The button's original 'text' (display text) is usually static from the template.
+                  // If button text itself is dynamic, that's a different parameter type.
+                  parametersSet = true; // Indicate that parameters were used for this button component
+              }
+          }
+          return newButtonDef;
+        });
+      }
+
+      // FIX: If parameters were set for this component (typically for HEADER (type TEXT) or BODY),
+      // remove the original 'text' field from the component, as it's replaced by parameters.
+      if (parametersSet && (newComponent.type === 'BODY' || (newComponent.type === 'HEADER' && newComponent.format === 'TEXT'))) {
+        delete newComponent.text;
+      }
+
+      // Remove example payload if it exists and parameters were set, as it's not needed for sending
+      if (parametersSet && newComponent.example) {
+          delete newComponent.example;
+      }
+
+      processedComponents.push(newComponent);
+    });
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: recipientE164,
+    type: 'template',
+    template: {
+      name: templateName,
+      language: { code: languageCode },
+      components: processedComponents.length > 0 ? processedComponents : undefined,
+    },
+  };
+  // For debugging the payload:
+  // console.log("[BulkSendProcessor] Sending WhatsApp Payload:", JSON.stringify(payload, null, 2));
+
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${WHATSAPP_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const responseData = await response.json();
+    // console.log("[BulkSendProcessor] WhatsApp API Response:", JSON.stringify(responseData, null, 2));
+
+
+    if (response.ok && responseData.messages && responseData.messages[0]?.id) {
+      return { success: true, message_id: responseData.messages[0].id };
+    } else {
+      const error = responseData.error || {};
+      console.error(`[BulkSendProcessor] WhatsApp API Error for ${recipientE164}:`, JSON.stringify(error)); // Log the full error
+      await logErrorToDb('BulkSendProcessorWhatsAppError', error.message || 'Unknown WhatsApp API error', error, String(error.code || response.status));
+      return {
+        success: false,
+        error_code: error.code || response.status,
+        error_message: `${error.type ? error.type + ' - ' : ''}${error.message || 'Unknown WhatsApp API Error'}${error.error_user_title ? ' (' + error.error_user_title + ')' : ''}${error.error_user_msg ? ' Msg: ' + error.error_user_msg : ''}`,
+      };
+    }
+  } catch (error) {
+    console.error(`[BulkSendProcessor] Fetch Error for ${recipientE164}:`, error);
+    await logErrorToDb('BulkSendProcessorFetchError', error.message || 'Fetch exception', { stack: error.stack, recipient: recipientE164 });
+    return { success: false, error_message: error.message || 'Network error or invalid JSON response' };
+  }
+}
+
+
+serve(async (req) => { 
+  const supabase = getSupabaseAdminClient();
+  const functionSource = 'BulkSendProcessor';
+  console.log(`[${functionSource}] Invoked.`);
+
+  try {
+    const { data: queueItems, error: fetchError } = await supabase
+      .from('message_queue')
+      .select(`
+        id, bulk_send_id, recipient_e164_phone, template_variables_used, image_url, status, attempt_count, next_attempt_at,
+        bulk_sends (
+          template_id,
+          business_whatsapp_number_id, 
+          message_templates_cache (name, components_json, language),
+          business_whatsapp_numbers (id, waba_phone_number_id, current_mps_target, mps_target_updated_at, is_rate_capped_today)
+        )
+      `)
+      .in('status', ['pending', 'retry_queued'])
+      .lte('next_attempt_at', new Date().toISOString())
+      .order('next_attempt_at', { ascending: true })
+      .limit(MAX_MESSAGES_PER_INVOCATION);
+
+    if (fetchError) {
+      await logErrorToDb(functionSource, 'Error fetching from message_queue', fetchError);
+      console.error(`[${functionSource}] DB Error fetching queue:`, fetchError.message);
+      return new Response(JSON.stringify({ error: 'Failed to fetch messages' }), { status: 500 });
+    }
+
+    if (!queueItems || queueItems.length === 0) {
+      console.log(`[${functionSource}] No messages in queue to process.`);
+      return new Response(JSON.stringify({ message: 'No messages in queue' }), { status: 200 });
+    }
+    console.log(`[${functionSource}] Fetched ${queueItems.length} items from queue.`);
+
+    const messagesByBusinessNumber = new Map<string, MessageQueueItem[]>();
+    for (const item of queueItems) {
+        const bs = item.bulk_sends as any; 
+        if (bs && bs.business_whatsapp_number_id && bs.business_whatsapp_numbers) {
+            const businessNumberDbId = bs.business_whatsapp_numbers.id;
+            if (!messagesByBusinessNumber.has(businessNumberDbId)) {
+                messagesByBusinessNumber.set(businessNumberDbId, []);
+            }
+            const enrichedItem = item as MessageQueueItem; 
+            enrichedItem.template_name = bs.message_templates_cache?.name;
+            enrichedItem.template_components_json = bs.message_templates_cache?.components_json;
+            enrichedItem.template_language = bs.message_templates_cache?.language;
+            enrichedItem.waba_phone_number_id_to_send_from = bs.business_whatsapp_numbers.waba_phone_number_id;
+            enrichedItem.business_whatsapp_number_db_id = businessNumberDbId; 
+
+            messagesByBusinessNumber.get(businessNumberDbId)!.push(enrichedItem);
+        } else {
+             const errDetails = {itemId: item.id, bulkSendId: item.bulk_send_id, hasBulkSends: !!bs, hasBizNumId: !!bs?.business_whatsapp_number_id, hasBizNumDetails: !!bs?.business_whatsapp_numbers};
+             await logErrorToDb(functionSource, 'Message item missing critical linked data for processing', errDetails);
+             console.warn(`[${functionSource}] Skipping item ${item.id} due to missing linked data:`, errDetails);
+        }
+    }
+
+
+    for (const [businessNumberDbId, messagesForThisNumber] of messagesByBusinessNumber.entries()) {
+      if (messagesForThisNumber.length === 0) continue;
+
+      let rateParams: BusinessRateLimitParams = (messagesForThisNumber[0] as any).bulk_sends.business_whatsapp_numbers as BusinessRateLimitParams;
+      
+      const mpsTarget = rateParams.is_rate_capped_today 
+          ? Math.min(rateParams.current_mps_target, 1.0) 
+          : rateParams.current_mps_target;
+      const maxToSendThisCycle = Math.max(1, Math.floor(mpsTarget <= 0 ? 1 : mpsTarget)); 
+
+
+      console.log(`[${functionSource}] Processing for BizNumDBID ${businessNumberDbId} (WABA ID: ${rateParams.waba_phone_number_id}). MPS Target: ${mpsTarget}, Max this cycle: ${maxToSendThisCycle}`);
+      let rateLimitHitForThisNumber = false;
+
+      for (let i = 0; i < Math.min(messagesForThisNumber.length, maxToSendThisCycle); i++) {
+        if (rateLimitHitForThisNumber) {
+            console.log(`[${functionSource}] Rate limit was hit for BizNumDBID ${businessNumberDbId}, skipping further messages for this number in this run.`);
+            break;
+        }
+
+        const queueMsg = messagesForThisNumber[i];
+        console.log(`[${functionSource}] Attempting to process queueMsg ID: ${queueMsg.id}, To: ${queueMsg.recipient_e164_phone}`);
+
+        if (!queueMsg.template_name || !queueMsg.template_components_json || !queueMsg.template_language || !queueMsg.waba_phone_number_id_to_send_from) {
+            const reason = 'Missing template/sender data in processor';
+            console.warn(`[${functionSource}] Skipping queueMsg ID ${queueMsg.id}: ${reason}`);
+            await logErrorToDb(functionSource, reason, { itemId: queueMsg.id });
+            await supabase.from('bulk_send_details').insert({
+                bulk_send_id: queueMsg.bulk_send_id,
+                mobile_number_e164: queueMsg.recipient_e164_phone,
+                status: 'skipped',
+                failure_reason: reason,
+            });
+            await supabase.from('message_queue').delete().eq('id', queueMsg.id); 
+            continue;
+        }
+
+        const sendResult = await sendWhatsAppMessage(
+          queueMsg.waba_phone_number_id_to_send_from,
+          queueMsg.recipient_e164_phone,
+          queueMsg.template_name,
+          queueMsg.template_language,
+          queueMsg.template_components_json,
+          queueMsg.template_variables_used,
+          queueMsg.image_url
+        );
+
+        if (sendResult.success && sendResult.message_id) {
+          console.log(`[${functionSource}] Successfully sent queueMsg ID ${queueMsg.id}. WA_Msg_ID: ${sendResult.message_id}`);
+          const { error: sentDetailError } = await supabase
+            .from('bulk_send_details')
+            .upsert({
+                bulk_send_id: queueMsg.bulk_send_id,
+                mobile_number_e164: queueMsg.recipient_e164_phone,
+                status: 'sent',
+                whatsapp_message_id: sendResult.message_id,
+                failure_reason: null 
+            }, {
+                onConflict: 'bulk_send_id, mobile_number_e164', 
+            });
+
+            if (sentDetailError) {
+                 console.error(`[${functionSource}] Error upserting sent status for queueMsg ID ${queueMsg.id}:`, sentDetailError.message);
+                 await logErrorToDb(functionSource, 'Error upserting sent bulk_send_details', sentDetailError);
+            }
+          await supabase.from('message_queue').delete().eq('id', queueMsg.id);
+        } else { 
+          console.warn(`[${functionSource}] Failed to send queueMsg ID ${queueMsg.id}. Reason: ${sendResult.error_message} (Code: ${sendResult.error_code})`);
+          if (sendResult.error_code && RATE_LIMIT_ERROR_CODE_WHATSAPP.includes(sendResult.error_code)) {
+            rateLimitHitForThisNumber = true;
+            const newCappedMps = Math.max(1.0, Math.floor(rateParams.current_mps_target * 0.8));
+            console.log(`[${functionSource}] Rate limit hit for BizNumDBID ${businessNumberDbId}. Capping MPS to ${newCappedMps}.`);
+            await supabase.from('business_whatsapp_numbers')
+              .update({ current_mps_target: newCappedMps, is_rate_capped_today: true, mps_target_updated_at: new Date().toISOString() })
+              .eq('id', businessNumberDbId);
+             await supabase.from('message_queue').update({
+                status: 'retry_queued',
+                last_attempt_at: new Date().toISOString(),
+                next_attempt_at: new Date(Date.now() + RETRY_BACKOFF_SECONDS[0] * 1000).toISOString(), 
+                attempt_count: queueMsg.attempt_count + 1 
+            }).eq('id', queueMsg.id);
+          } else if (queueMsg.attempt_count < MAX_RETRIES) {
+            const nextAttemptDelay = RETRY_BACKOFF_SECONDS[queueMsg.attempt_count] || RETRY_BACKOFF_SECONDS[MAX_RETRIES -1];
+            const nextAttemptTime = new Date(Date.now() + nextAttemptDelay * 1000).toISOString();
+            console.log(`[${functionSource}] Requeuing queueMsg ID ${queueMsg.id} for retry (attempt ${queueMsg.attempt_count + 1}) at ${nextAttemptTime}.`);
+            await supabase.from('message_queue').update({
+              status: 'retry_queued',
+              attempt_count: queueMsg.attempt_count + 1,
+              last_attempt_at: new Date().toISOString(),
+              next_attempt_at: nextAttemptTime,
+            }).eq('id', queueMsg.id);
+            await supabase.from('bulk_send_details').insert({ 
+                bulk_send_id: queueMsg.bulk_send_id,
+                mobile_number_e164: queueMsg.recipient_e164_phone,
+                status: 'failed', 
+                failure_reason: `Retryable error: ${sendResult.error_message} (attempt ${queueMsg.attempt_count + 1})`,
+                whatsapp_message_id: null, 
+            });
+          } else { 
+            const reason = `Max retries (${MAX_RETRIES}) or permanent error: ${sendResult.error_message}`;
+            console.error(`[${functionSource}] Permanent failure for queueMsg ID ${queueMsg.id}: ${reason}`);
+            await supabase.from('bulk_send_details')
+              .upsert({ 
+                bulk_send_id: queueMsg.bulk_send_id,
+                mobile_number_e164: queueMsg.recipient_e164_phone,
+                status: 'failed',
+                failure_reason: reason,
+                whatsapp_message_id: null
+              }, {
+                onConflict: 'bulk_send_id, mobile_number_e164', 
+              });
+            await supabase.from('message_queue').delete().eq('id', queueMsg.id);
+          }
+        }
+      } 
+
+      if (!rateLimitHitForThisNumber && !rateParams.is_rate_capped_today) {
+        const now = Date.now();
+        const lastUpdate = rateParams.mps_target_updated_at ? Date.parse(rateParams.mps_target_updated_at) : 0;
+        if ((now - lastUpdate) / 1000 > RATE_ADAPTATION_INTERVAL_SECONDS) {
+          const newMps = rateParams.current_mps_target + RATE_ADAPTATION_INCREMENT_MPS;
+          console.log(`[${functionSource}] Adapting MPS for BizNumDBID ${businessNumberDbId} from ${rateParams.current_mps_target} to ${newMps}`);
+          await supabase.from('business_whatsapp_numbers')
+            .update({ current_mps_target: newMps, mps_target_updated_at: new Date().toISOString() })
+            .eq('id', businessNumberDbId);
+        }
+      }
+    } 
+
+    console.log(`[${functionSource}] Processing finished for this invocation.`);
+    return new Response(JSON.stringify({ success: true, processed_batch_size: queueItems.length }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  } catch (e) {
+    console.error(`[${functionSource}] Unhandled top-level exception:`, e.message, e.stack);
+    await logErrorToDb(functionSource, 'Unhandled exception in processor', { message: e.message, stack: e.stack });
+    return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+  }
+})

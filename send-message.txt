@@ -1,0 +1,338 @@
+// supabase/functions/send-message/index.ts
+// deno-lint-ignore-file no-explicit-any
+// Edge Function ‑ send‑message (v1.2 - Incorporating suggestions)
+// Implements: dual‑client auth, Zod validation, per‑number WA token, idempotent WA call,
+// PG procedure insert, unified structured logging.
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
+// Assuming a shared module structure as you indicated
+// TODO: adjust path once the shared helper module is placed in /functions/_shared
+import { log as sharedLog, callWhatsAppApi as sharedCallWhatsAppApi } from "../_shared/wa.ts"; // Assuming these are exported from your shared file
+
+/* ────────────────────────────────────────────────────────────────
+ * Environment
+ * ────────────────────────────────────────────────────────────── */
+const SUPABASE_URL        = Deno.env.get("SUPABASE_URL");
+const SERVICE_ROLE_KEY    = Deno.env.get("CUSTOM_SERVICE_ROLE_KEY");
+const PUBLIC_ANON_KEY     = Deno.env.get("SUPABASE_ANON_KEY");
+
+if (!SUPABASE_URL || !SERVICE_ROLE_KEY || !PUBLIC_ANON_KEY) {
+  throw new Error("Missing required env vars – check SUPABASE_URL, CUSTOM_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY");
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Request schema
+ * ────────────────────────────────────────────────────────────── */
+const RequestSchema = z.object({
+  conversation_id:  z.string().uuid(),
+  type:             z.enum(["text", "template"]),
+  text_content:     z.string().min(1).optional(),
+  template_name:    z.string().optional(),
+  template_language: z.string().optional(),
+  template_variables: z.record(z.any()).optional(), // Can be more specific if structure is known
+  header_image_url: z.string().url().optional(),
+}).superRefine((data, ctx) => {
+  if (data.type === "text" && !data.text_content) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "text_content is required when type=\"text\"" });
+  }
+  if (data.type === "template" && (!data.template_name || !data.template_language)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "template_name and template_language are required when type=\"template\"" });
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * Handler
+ * ────────────────────────────────────────────────────────────── */
+serve(async (req: Request) => {
+  const functionName = "send-message"; // For structured logging
+
+  // Use the shared log function if available, otherwise fallback to a local one
+  const log = typeof sharedLog === 'function' ? (evt: string, extra?: Record<string, unknown>) => sharedLog(evt, {fn: functionName, ...extra}) : console.log;
+
+
+  if (req.method !== "POST") {
+    log("method_not_allowed", { method: req.method });
+    return new Response(JSON.stringify({ error: "Method Not Allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
+  }
+
+  let parsedData;
+  try {
+    const json = await req.json();
+    const parsed = RequestSchema.safeParse(json);
+    if (!parsed.success) {
+      log("bad_request_validation", { errors: parsed.error.flatten() });
+      return new Response(JSON.stringify({ error: "Bad request", details: parsed.error.flatten() }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+    parsedData = parsed.data;
+  } catch (e) {
+    log("bad_request_json_parse", { error: e?.message });
+    return new Response(JSON.stringify({ error: "Bad request: Invalid JSON" }), { status: 400, headers: { "Content-Type": "application/json" } });
+  }
+
+  const {
+    conversation_id,
+    type,
+    text_content,
+    template_name,
+    template_language,
+    template_variables,
+    header_image_url,
+  } = parsedData;
+
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) {
+    log("auth_required_header_missing");
+    return new Response(JSON.stringify({ error: "Authentication required: Missing Authorization header" }), { status: 401, headers: { "Content-Type": "application/json" } });
+  }
+
+  const supabaseUser: SupabaseClient = createClient(
+    SUPABASE_URL!, // Already checked for null/undefined
+    PUBLIC_ANON_KEY!, // Already checked
+    {
+      global: { headers: { Authorization: authHeader } },
+      auth:   { persistSession: false, autoRefreshToken: false },
+    },
+  );
+  const supabaseAdmin: SupabaseClient = createClient(
+    SUPABASE_URL!,
+    SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false, autoRefreshToken: false } },
+  );
+
+  const { data: { user: authedUser }, error: userErr } = await supabaseUser.auth.getUser();
+  if (userErr || !authedUser) {
+    log("auth_invalid_token", { error: userErr?.message });
+    return new Response(JSON.stringify({ error: userErr?.message || "Invalid token" }), { status: 401, headers: { "Content-Type": "application/json" } });
+  }
+  // Prevent service role JWTs from being used as user tokens
+  if (["service_role", "supabase_admin"].includes((authedUser as any).role)) {
+    log("auth_forbidden_role_as_user", { userId: authedUser.id, role: (authedUser as any).role });
+    return new Response(JSON.stringify({ error: "Forbidden: Service roles cannot use this endpoint as a user." }), { status: 403, headers: { "Content-Type": "application/json" } });
+  }
+  const agentId = authedUser.id;
+
+  try {
+    /* 1. RLS‑backed permission check (or equivalent via RPC) */
+    const { data: canSendResult, error: rpcErr } = await supabaseUser.rpc(
+      "can_agent_insert_into_conversation", // Ensure this function exists and works as expected
+      { agent_id: agentId, target_conversation_id: conversation_id },
+    );
+    if (rpcErr) {
+      log("rpc_permission_check_error", { rpc: "can_agent_insert_into_conversation", error: rpcErr, agentId, conversation_id });
+      return new Response(JSON.stringify({ error: "Internal RPC error checking permissions" }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+    if (canSendResult !== true) {
+      log("permission_denied_send_message", { agentId, conversation_id, canSendResult });
+      return new Response(JSON.stringify({ error: "Permission denied to send message to this conversation or conversation unsuitable." }), { status: 403, headers: { "Content-Type": "application/json" } });
+    }
+
+    /* 2. Pull conversation & WA credentials */
+    const { data: convo, error: convoErr } = await supabaseAdmin
+      .from("conversations")
+      .select("contact_e164_phone, business_whatsapp_numbers(waba_phone_number_id, access_token)") // Ensure 'access_token' column exists in business_whatsapp_numbers
+      .eq("id", conversation_id)
+      .single();
+
+    if (convoErr || !convo || !convo.business_whatsapp_numbers || !convo.contact_e164_phone) {
+      log("fetch_convo_details_error", { error: convoErr?.message, conversation_id, convoFound: !!convo, bizNumFound: !!convo?.business_whatsapp_numbers });
+      return new Response(JSON.stringify({ error: "Conversation not found, misconfigured, or business number details missing." }), { status: 404, headers: { "Content-Type": "application/json" } });
+    }
+    const { waba_phone_number_id, access_token } = convo.business_whatsapp_numbers as any; // Type assertion for joined table
+    const recipientPhone = convo.contact_e164_phone;
+
+    if (!waba_phone_number_id || !access_token) {
+        log("missing_waba_details", { conversation_id, waba_id_present: !!waba_phone_number_id, token_present: !!access_token });
+        return new Response(JSON.stringify({ error: "Business WhatsApp number configuration (WABA ID or Access Token) is missing for this conversation." }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+
+
+    /* 3. Build WA payload */
+    let waPayload: Record<string, unknown>;
+    if (type === "text") {
+      waPayload = { type: "text", text: { body: text_content! } }; // text_content is validated by Zod to be present
+    } else { // type === "template"
+      const { data: tpl, error: tplErr } = await supabaseAdmin
+        .from("message_templates_cache")
+        .select("components_json") // This should be components_json from your DB
+        .eq("name", template_name!) // template_name is validated by Zod
+        .eq("language", template_language!) // template_language is validated by Zod
+        .eq("status_from_whatsapp", "APPROVED")
+        .single();
+
+      if (tplErr || !tpl || !tpl.components_json) {
+        log("fetch_template_error", { template_name, template_language, error: tplErr?.message, templateFound: !!tpl, componentsFound: !!tpl?.components_json });
+        return new Response(JSON.stringify({ error: "WhatsApp template not found, not approved, or components_json missing.", code: "WA_TEMPLATE_NOT_FOUND" }), { status: 422, headers: { "Content-Type": "application/json" } });
+      }
+      // Assuming components_json is { "components": [...] } or just [...]
+      const originalComponents = Array.isArray(tpl.components_json) ? tpl.components_json : tpl.components_json.components;
+      const comps = buildTemplateComponents(originalComponents, template_variables, header_image_url);
+      waPayload = {
+        type: "template",
+        template: {
+          name: template_name,
+          language: { code: template_language },
+          components: comps.length ? comps : undefined,
+        },
+      };
+    }
+
+    /* 4. Call WA Graph API */
+    const idempotencyKey = crypto.randomUUID(); // Good practice for WA API calls
+    // Ensure your sharedCallWhatsAppApi uses this key, e.g., in 'Whatsapp-Business-Request-Id' header
+    const callApiFn = typeof sharedCallWhatsAppApi === 'function' ? sharedCallWhatsAppApi : callWhatsAppApi; // Fallback if shared not imported
+    const sendRes = await callApiFn(
+      { wabaPhoneId: waba_phone_number_id, token: access_token, idempotencyKey },
+      recipientPhone,
+      waPayload,
+    );
+
+    if (!sendRes.success || !sendRes.message_id) {
+      const waErrorCode = [429, 471].includes(sendRes.error_code ?? 0) ? 503 : 502; // Service Unavailable for rate limits
+      log("wa_api_send_fail", { error: sendRes.error_message, code: sendRes.error_code, details: sendRes.error_details, recipientPhone });
+      return new Response(
+        JSON.stringify({ error: `WhatsApp API Error: ${sendRes.error_message}`, code: sendRes.error_code, details: sendRes.error_details }),
+        { status: waErrorCode, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    /* 5. Persist via stored procedure */
+    const { data: messageRow, error: spErr } = await supabaseAdmin.rpc("insert_agent_message", {
+      p_conversation_id: conversation_id,
+      p_agent_id:         agentId,
+      p_whatsapp_id:      sendRes.message_id,
+      p_content_type:     type, // Ensure this matches your ENUM values
+      p_text_content:     type === "text" ? text_content : null,
+      p_template_name:    type === "template" ? template_name : null,
+      p_template_vars:    type === "template" ? template_variables : null,
+      // p_media_url: if applicable, not handled in current request body
+    });
+
+    if (spErr) {
+      log("db_persist_error_after_send", { error: spErr, conversation_id, whatsapp_message_id: sendRes.message_id });
+      // Message was sent via WA, but DB log failed. This is a critical internal error.
+      // Return success to client as message was sent, but log failure for ops.
+      // Consider a more robust reconciliation mechanism for such cases.
+      // For now, the client gets success, but we log the DB error.
+    } else if (messageRow && (messageRow as any).success === false) { // Assuming your RPC returns a JSON with a success flag
+        log("db_persist_rpc_returned_failure", { rpc_response: messageRow, conversation_id, whatsapp_message_id: sendRes.message_id });
+    }
+
+
+    log("message_sent_successfully", { conversation_id, agentId, type, whatsapp_message_id: sendRes.message_id });
+    return new Response(JSON.stringify({ success: true, message_id: sendRes.message_id, db_log_result: messageRow ?? "Logged (check server for details)" }), {
+      headers: { "Content-Type": "application/json" },
+    });
+
+  } catch (e: any) {
+    log("unhandled_exception", { error: e?.message ?? e, stack: e?.stack, conversation_id, agentId });
+    return new Response(JSON.stringify({ error: "An unexpected error occurred." }), { status: 500, headers: { "Content-Type": "application/json" } });
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────
+ * Helpers
+ * ────────────────────────────────────────────────────────────── */
+function buildTemplateComponents(
+  originalComponents: any[] | undefined,
+  templateVariables: Record<string, any> | undefined,
+  headerImageUrl?: string,
+): any[] {
+  if (!Array.isArray(originalComponents)) return [];
+  const processed: any[] = [];
+
+  for (const originalComp of originalComponents) {
+    const componentCopy = { ...originalComp }; // Shallow copy each component
+    let parametersWereSetForThisComponent = false;
+
+    if (componentCopy.type === "HEADER") {
+      if (componentCopy.format === "IMAGE" && headerImageUrl) {
+        componentCopy.parameters = [{ type: "image", image: { link: headerImageUrl } }];
+        parametersWereSetForThisComponent = true;
+      } else if (componentCopy.format === "TEXT" && templateVariables?.header && Array.isArray(templateVariables.header)) {
+        // Assuming templateVariables.header is like [{text: "value1"}, {text: "value2"}]
+        componentCopy.parameters = templateVariables.header.map((v: any) => ({ type: "text", text: String(v.text) }));
+        parametersWereSetForThisComponent = true;
+      }
+      // Add handling for DOCUMENT, VIDEO header types if they take variables
+    } else if (componentCopy.type === "BODY" && templateVariables?.body && Array.isArray(templateVariables.body)) {
+      // Assuming templateVariables.body is like [{text: "value1"}, {text: "value2"}]
+      componentCopy.parameters = templateVariables.body.map((v: any) => ({ type: "text", text: String(v.text) }));
+      parametersWereSetForThisComponent = true;
+    } else if (componentCopy.type === "BUTTONS" && Array.isArray(componentCopy.buttons) && templateVariables?.buttons && Array.isArray(templateVariables.buttons)) {
+      componentCopy.buttons = componentCopy.buttons.map((buttonDefinition: any, buttonIndex: number) => {
+        const newButtonDefinition = { ...buttonDefinition }; // Copy button
+        // Find variable for this specific button by index.
+        // Assumes templateVariables.buttons is an array like [{ "index": "0", "sub_type": "url", "parameter": "dynamic_value_for_url_suffix" }]
+        // or [{ "index": "1", "sub_type": "quick_reply", "parameter": "developer_payload_for_quick_reply" }]
+        const buttonVar = templateVariables.buttons.find((variable: any) => parseInt(String(variable.index)) === buttonIndex && variable.sub_type === newButtonDefinition.sub_type);
+
+        if (buttonVar && newButtonDefinition.type === "URL" && newButtonDefinition.sub_type === "url" && typeof newButtonDefinition.url === 'string' && typeof buttonVar.parameter === 'string') {
+          // For URL buttons, the parameter is the value to be appended to the static URL part from the template,
+          // or to replace a placeholder within it. The example replaces {{1}}.
+          newButtonDefinition.url = newButtonDefinition.url.replace(/\{\{1\}\}|\[\[1\]\]/g, buttonVar.parameter);
+          // parametersWereSetForThisComponent = true; // Individual button parameters don't use top-level component.parameters
+        }
+        // Add handling for quick reply button payloads if necessary
+        // if (buttonVar && newButtonDefinition.type === "QUICK_REPLY" && ...) { newButtonDefinition.payload = buttonVar.parameter; }
+        return newButtonDefinition;
+      });
+    }
+
+    // If parameters were set for BODY or TEXT HEADER, remove the original template text
+    if (parametersWereSetForThisComponent && (componentCopy.type === 'BODY' || (componentCopy.type === 'HEADER' && componentCopy.format === 'TEXT'))) {
+      delete componentCopy.text;
+    }
+
+    // Remove 'example' data as it's not needed for sending API calls
+    if (componentCopy.example) {
+      delete componentCopy.example;
+    }
+
+    processed.push(componentCopy);
+  }
+  return processed;
+}
+
+// Fallback local callWhatsAppApi if not imported from shared
+// Ensure this function is consistent with the one in your shared module if you use it.
+async function callWhatsAppApi(
+  params: { wabaPhoneId: string; token: string; idempotencyKey?: string },
+  recipientPhone: string,
+  messagePayload: Record<string, any>
+): Promise<{ success: boolean; message_id?: string; error_code?: number; error_message?: string; error_details?: any }> {
+    const { wabaPhoneId, token, idempotencyKey } = params;
+    const apiUrl = `https://graph.facebook.com/v19.0/${wabaPhoneId}/messages`;
+    const headers: HeadersInit = {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+    };
+    if (idempotencyKey) {
+        // Correct header for idempotency key for message send requests is typically not standard,
+        // but if your specific API wrapper or Meta introduces one, use it.
+        // Common for some APIs: 'Idempotency-Key' or 'X-Request-ID'.
+        // For WhatsApp, idempotency is generally handled by unique message IDs you might generate and track,
+        // or just by not retrying blindly. Let's assume it's not a standard WA header for now.
+        // log("info_idempotency_key_usage", { idempotencyKey }); // If you were to use it in a header.
+    }
+
+    const fullPayload = {
+        messaging_product: "whatsapp",
+        to: recipientPhone,
+        ...messagePayload,
+    };
+
+    try {
+        const response = await fetch(apiUrl, { method: 'POST', headers, body: JSON.stringify(fullPayload) });
+        const responseData = await response.json();
+        if (response.ok && responseData.messages && responseData.messages[0]?.id) {
+            return { success: true, message_id: responseData.messages[0].id };
+        } else {
+            const error = responseData.error || {};
+            return { success: false, error_code: error.code || response.status, error_message: error.message || `HTTP Error ${response.status}`, error_details: error };
+        }
+    } catch (e) {
+        return { success: false, error_message: e.message || "Network error", error_details: e };
+    }
+}

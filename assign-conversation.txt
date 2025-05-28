@@ -1,0 +1,168 @@
+// supabase/functions/assign-conversation/index.ts
+// deno-lint-ignore-file no-explicit-any
+// Edge Function – assign‑conversation (v1.2)
+// PATCH /assign-conversation  { conversation_id, assign_to_user_id?, reason? }
+// Validates payload → RPC → returns updated conversation. CORS + severity logging + optimistic locking.
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
+import { log, LogLevel } from "../_shared/log.ts"; // Ensure this path is correct
+
+/*───────────────────────────────
+  Env & constants
+──────────────────────────────*/
+const SUPABASE_URL    = Deno.env.get("SUPABASE_URL");
+const PUBLIC_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
+if (!SUPABASE_URL || !PUBLIC_ANON_KEY) throw new Error("Missing Supabase env vars: SUPABASE_URL, PUBLIC_ANON_KEY");
+
+/* CORS Helper & JSON Response Helper */
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*", // Consider restricting in production to specific frontend origins
+  "Access-Control-Allow-Methods": "PATCH, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, If-Match", // Ensure If-Match is allowed
+};
+const jsonResponse = (body: unknown, status = 200, extraHeaders: Record<string,string> = {}): Response =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...extraHeaders },
+  });
+
+/*───────────────────────────────
+  Validation Schema
+──────────────────────────────*/
+const AssignConversationSchema = z.object({
+  conversation_id:   z.string().uuid({ message: "conversation_id must be a valid UUID." }),
+  assign_to_user_id: z.string().uuid({ message: "assign_to_user_id must be a valid UUID if provided." }).nullish(), // Allows null, and optional makes the key itself optional
+  reason:            z.string().trim().max(255, { message: "Reason cannot exceed 255 characters." }).optional(),
+});
+
+type AssignConversationBody = z.infer<typeof AssignConversationSchema>;
+
+/*───────────────────────────────
+  Handler
+──────────────────────────────*/
+serve(async (req: Request) => {
+  // Handle CORS preflight requests
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: CORS_HEADERS });
+  }
+
+  const functionName = "assign-conversation";
+  const reqId = crypto.randomUUID();
+  const logger = (evt: string, extra: Record<string, unknown> = {}, lvl: LogLevel = "info") =>
+    log(evt, { fn: functionName, reqId, ...extra }, { level: lvl });
+
+  if (req.method !== "PATCH") {
+    logger("method_not_allowed", { method: req.method }, "warn");
+    return jsonResponse({ code: "METHOD_NOT_ALLOWED", message: "Method must be PATCH." }, 405);
+  }
+
+  let body: AssignConversationBody;
+  try {
+    const rawJson = await req.json();
+    const parsed = AssignConversationSchema.safeParse(rawJson);
+    if (!parsed.success) {
+      logger("bad_request_validation", { issues: parsed.error.flatten() }, "warn");
+      return jsonResponse({ code: "BAD_REQUEST", message: "Invalid payload.", details: parsed.error.flatten() }, 400);
+    }
+    body = parsed.data;
+  } catch (e) {
+    logger("bad_request_json_parse", { error: e?.message }, "warn");
+    return jsonResponse({ code: "BAD_REQUEST", message: "Invalid JSON payload." }, 400);
+  }
+
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) {
+    logger("auth_header_missing", {}, "warn");
+    return jsonResponse({ code: "AUTH_REQUIRED", message: "Missing Authorization header." }, 401);
+  }
+
+  const supabaseUserClient: SupabaseClient = createClient(
+    SUPABASE_URL,
+    PUBLIC_ANON_KEY,
+    { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false, autoRefreshToken: false } },
+  );
+
+  const { data: { user: actor }, error: userErr } = await supabaseUserClient.auth.getUser();
+  if (userErr || !actor) {
+    logger("auth_invalid_session", { error: userErr?.message }, "warn");
+    return jsonResponse({ code: "AUTH_INVALID", message: userErr?.message ?? "Invalid or expired session." }, 401);
+  }
+
+  const actorRole = (actor as any).app_metadata?.role ?? "user"; // Ensure your JWT populates app_metadata.role
+  if (["service_role", "supabase_admin"].includes(actorRole)) { // Removed "whatsapp_webhook" unless it's a user-assignable role
+    logger("auth_forbidden_role_as_user", { userId: actor.id, role: actorRole }, "warn");
+    return jsonResponse({ code: "FORBIDDEN_ROLE", message: "This action is not permitted for the provided system role." }, 403);
+  }
+
+  // Optimistic locking: Read version from If-Match header
+  const ifMatchHeader = req.headers.get("If-Match");
+  if (!ifMatchHeader) {
+    logger("precondition_required_if_match", {}, "warn");
+    return jsonResponse({ code: "PRECONDITION_REQUIRED", message: "If-Match header with conversation version is required." }, 428);
+  }
+  const version = parseInt(ifMatchHeader.replace(/"/g, ''), 10); // ETag format is often quoted like "1"
+  if (isNaN(version) || version < 0) {
+    logger("bad_request_if_match_invalid", { ifMatch: ifMatchHeader }, "warn");
+    return jsonResponse({ code: "BAD_REQUEST", message: "Invalid If-Match header value for version." }, 400);
+  }
+
+  try {
+    logger("rpc_call_attempt", { rpc: "assign_conversation_and_update_related", actorId: actor.id, conversationId: body.conversation_id, newAssigneeId: body.assign_to_user_id, version, reason: body.reason });
+
+    const rpcParams: any = {
+      p_actor_id:        actor.id,
+      p_conversation_id: body.conversation_id,
+      p_version:         version,
+    };
+    // Only include p_new_assignee_id if assign_to_user_id was present in the body (even if null)
+    if (body.assign_to_user_id !== undefined) {
+      rpcParams.p_new_assignee_id = body.assign_to_user_id;
+    }
+    // Only include p_reason if reason was present in the body
+    if (body.reason !== undefined) {
+      rpcParams.p_reason = body.reason;
+    }
+
+
+    const { data: rpcResult, error: rpcErr } = await supabaseUserClient.rpc("assign_conversation_and_update_related", rpcParams);
+
+    if (rpcErr) {
+      let httpStatus = 500;
+      const hint = rpcErr.hint ?? ""; // Hint from RAISE EXCEPTION ... USING HINT = '40x'
+      const detail = (typeof rpcErr.details === 'string' && rpcErr.details) || rpcErr.message; // Detail from RAISE EXCEPTION ... USING DETAIL
+
+      if (detail.includes("IDEMPOTENT_NO_CHANGE")) { // Check detail for our custom exception text
+          logger("rpc_idempotent_no_change", { conversationId: body.conversation_id, result: rpcResult });
+          // For idempotency, the RPC now returns the current conversation state directly
+          // if the SQL function was changed to RETURN to_jsonb(v_current_conversation) in the idempotent block.
+          // If it still raises an exception with HINT='200', this mapping works.
+          if (hint.includes("200")) {
+              return jsonResponse({ success: true, message: "No change needed, assignment is already current.", data: rpcResult });
+          }
+      }
+      if (hint.includes("409") || detail.includes("OPTIMISTIC_LOCK_FAILED")) httpStatus = 409;
+      else if (hint.includes("404") || detail.includes("CONVERSATION_NOT_FOUND")) httpStatus = 404;
+      else if (hint.includes("403") || detail.includes("ACTION_FORBIDDEN") || detail.includes("PERMISSION_DENIED")) httpStatus = 403;
+      else if (hint.includes("400") || detail.includes("INVALID_ASSIGNEE") || detail.includes("INVALID_OPERATION")) httpStatus = 400;
+
+
+      logger("rpc_call_failed", { error: rpcErr.message, code: rpcErr.code, details: rpcErr.details, hint, conversationId: body.conversation_id });
+      return jsonResponse({ code: rpcErr.code ?? "RPC_ERROR", message: rpcErr.message, details: rpcErr.details }, httpStatus);
+    }
+
+    const newVersionFromResponse = (rpcResult as any)?.updated_conversation?.version;
+    const headers: Record<string, string> = {};
+    if (newVersionFromResponse !== undefined) {
+      headers["ETag"] = `"${newVersionFromResponse}"`;
+    }
+
+    logger("rpc_call_success", { conversationId: body.conversation_id, newAssigneeId: body.assign_to_user_id, result: rpcData });
+    return jsonResponse({ success: true, message: "Conversation assignment updated successfully.", data: rpcResult }, 200, headers);
+
+  } catch (e: any) {
+    logger("unhandled_exception", { error: e?.message ?? e, stack: e?.stack, conversationId: body.conversation_id });
+    return jsonResponse({ code: "UNEXPECTED_ERROR", message: "An unexpected server error occurred." }, 500);
+  }
+});

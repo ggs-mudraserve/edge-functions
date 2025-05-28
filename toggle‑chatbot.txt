@@ -1,0 +1,207 @@
+// supabase/functions/toggle-chatbot/index.ts
+// deno-lint-ignore-file no-explicit-any
+// Edge Function – toggle‑chatbot (v1.2)
+// PATCH /toggle-chatbot  { conversation_id, is_active }
+// – RLS-safe initial fetch and RLS-governed update
+// – optimistic lock with If‑Match / version column
+// – idempotent 204, fresh ETag on success
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
+import { log, LogLevel } from "../_shared/log.ts"; // Ensure this path and export are correct
+
+/*────────────────────────────────────────────────────*/
+/** ENV */
+/*────────────────────────────────────────────────────*/
+const SUPABASE_URL    = Deno.env.get("SUPABASE_URL");
+const PUBLIC_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
+// SERVICE_ROLE_KEY is needed for the pre-check to see if chatbot_endpoint_url exists,
+// as the user might not have direct select grants on business_whatsapp_numbers.
+const SERVICE_ROLE_KEY = Deno.env.get("CUSTOM_SERVICE_ROLE_KEY");
+
+if (!SUPABASE_URL || !PUBLIC_ANON_KEY || !SERVICE_ROLE_KEY) {
+  throw new Error("Missing required env vars: SUPABASE_URL, SUPABASE_ANON_KEY, or CUSTOM_SERVICE_ROLE_KEY");
+}
+
+/*────────────────────────────────────────────────────*/
+/** Helpers */
+/*────────────────────────────────────────────────────*/
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*", // Consider restricting in production
+  "Access-Control-Allow-Methods": "PATCH,OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization,Content-Type,If-Match",
+  "Vary": "Origin",
+};
+const jsonResponse = (body: unknown, status = 200, extraHeaders: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...extraHeaders } });
+
+/*────────────────────────────────────────────────────*/
+/** Validation */
+/*────────────────────────────────────────────────────*/
+const ToggleChatbotSchema = z.object({
+  conversation_id: z.string().uuid({ message: "conversation_id must be a valid UUID." }),
+  is_active:       z.boolean({ errorMap: () => ({ message: "is_active must be true or false." }) }),
+});
+
+type ToggleChatbotBody = z.infer<typeof ToggleChatbotSchema>;
+
+/*────────────────────────────────────────────────────*/
+/** Handler */
+/*────────────────────────────────────────────────────*/
+serve(async (req: Request) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
+
+  const functionName = "toggle-chatbot";
+  const reqId = crypto.randomUUID();
+  const logger = (evt: string, extra: Record<string, unknown> = {}, lvl: LogLevel = "info") =>
+    log(evt, { fn: functionName, reqId, ...extra }, { level: lvl });
+
+  if (req.method !== "PATCH") { // Changed to PATCH as per your v1.1 code
+    logger("method_not_allowed", { method: req.method }, "warn");
+    return jsonResponse({ code: "METHOD_NOT_ALLOWED", message: "Method must be PATCH." }, 405);
+  }
+
+  let body: ToggleChatbotBody;
+  try {
+    const rawJson = await req.json();
+    const parsed = ToggleChatbotSchema.safeParse(rawJson);
+    if (!parsed.success) {
+      logger("bad_request_validation", { issues: parsed.error.flatten() }, "warn");
+      return jsonResponse({ code: "BAD_REQUEST", message: "Invalid payload.", details: parsed.error.flatten() }, 400);
+    }
+    body = parsed.data;
+  } catch (e) {
+    logger("bad_request_json_parse", { error: e?.message }, "warn");
+    return jsonResponse({ code: "BAD_REQUEST", message: "Invalid JSON payload." }, 400);
+  }
+
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) {
+    logger("auth_header_missing", {}, "warn");
+    return jsonResponse({ code: "AUTH_REQUIRED", message: "Missing Authorization header." }, 401);
+  }
+
+  // Admin client for pre-check (chatbot configuration)
+  const supabaseAdmin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY!, { // Added ! as we check for SERVICE_ROLE_KEY above
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
+
+  // User-scoped client for the actual update to respect RLS
+  const supabaseUserClient: SupabaseClient = createClient(
+    SUPABASE_URL!, // Already checked
+    PUBLIC_ANON_KEY!, // Already checked
+    { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false, autoRefreshToken: false } },
+  );
+
+  const { data: { user }, error: userErr } = await supabaseUserClient.auth.getUser();
+  if (userErr || !user) {
+    logger("auth_invalid_session", { error: userErr?.message }, "warn");
+    return jsonResponse({ code: "AUTH_INVALID", message: userErr?.message ?? "Invalid or expired session." }, 401);
+  }
+
+  const userRole = (user as any).app_metadata?.role ?? "user";
+  if (["service_role", "supabase_admin"].includes(userRole)) {
+    logger("auth_forbidden_role", { userId: user.id, role: userRole }, "warn");
+    return jsonResponse({ code: "FORBIDDEN_ROLE", message: "This action is not permitted for the provided system role." }, 403);
+  }
+
+  // Optimistic lock header
+  const ifMatchHeader = req.headers.get("If-Match");
+  if (!ifMatchHeader) {
+    logger("precondition_required_if_match", {}, "warn");
+    return jsonResponse({ code: "PRECONDITION_REQUIRED", message: "If-Match header with conversation version is required." }, 428);
+  }
+  const version = Number(ifMatchHeader.replace(/"/g, "")); // ETags are often quoted like "1"
+  if (isNaN(version) || version < 0) {
+    logger("bad_request_if_match_invalid", { ifMatch: ifMatchHeader }, "warn");
+    return jsonResponse({ code: "BAD_REQUEST", message: "Invalid If-Match header value for version." }, 400);
+  }
+
+  try {
+    logger("toggle_attempt", { userId: user.id, conversationId: body.conversation_id, newChatbotState: body.is_active, version });
+
+    // 1. Fetch conversation using ADMIN client to get chatbot_endpoint_url (user RLS might not allow access to joined business_whatsapp_numbers)
+    //    AND to get the current is_chatbot_active state and version for idempotency/optimistic lock checks.
+    const { data: convoData, error: convoError } = await supabaseAdmin
+      .from("conversations")
+      .select(`
+        id,
+        is_chatbot_active,
+        version,
+        assigned_agent_id, 
+        segment,
+        business_whatsapp_numbers ( chatbot_endpoint_url )
+      `)
+      .eq("id", body.conversation_id)
+      .maybeSingle();
+
+    if (convoError) {
+      logger("db_fetch_convo_error_admin", { error: convoError.message, conversationId: body.conversation_id });
+      return jsonResponse({ code: "DB_ERROR", message: "Error fetching conversation details." }, 500);
+    }
+
+    if (!convoData) {
+      logger("convo_not_found", { conversationId: body.conversation_id }, "warn");
+      return jsonResponse({ code: "NOT_FOUND", message: "Conversation not found." }, 404);
+    }
+
+    // RLS-like check: Manually verify if the current user is the assigned agent/TL of this conversation
+    // This is needed because the subsequent UPDATE will use supabaseUserClient and rely on RLS,
+    // but we want to provide a clear error if the initial check (can this user even attempt this?) fails.
+    // This duplicates some RLS logic but ensures the "chatbot_not_configured" check comes after a basic ownership check.
+    // Alternatively, the RLS SELECT policy on `conversations` for the user should allow them to see this row.
+    // Let's assume the RLS `SELECT` on `conversations` for the user already ensures they can only fetch conversations they manage.
+    // If the `supabaseUserClient` was used for the fetch above and it failed, it would mean RLS denied access.
+    // Since we used `supabaseAdmin` for the fetch to get `chatbot_endpoint_url` (which might not be RLS-visible to user),
+    // we need to now verify if the *current user* would be allowed to update this conversation by their RLS policy.
+    // The simplest way is to let the subsequent .update() call with supabaseUserClient handle this via RLS.
+
+    const businessNumberConfig = convoData.business_whatsapp_numbers as any;
+    if (!businessNumberConfig || !businessNumberConfig.chatbot_endpoint_url) {
+      logger("chatbot_not_configured_for_number", { conversationId: body.conversation_id }, "warn");
+      return jsonResponse({ code: "CHATBOT_NOT_CONFIGURED", message: "No chatbot is configured for this conversation's business number. Toggle has no effect." }, 400);
+    }
+
+    // Idempotency check: if current state is already the target state
+    if (convoData.is_chatbot_active === body.is_active) {
+      logger("idempotent_no_change_needed", { conversationId: body.conversation_id, currentState: convoData.is_chatbot_active });
+      return new Response(null, { status: 204, headers: { ...CORS_HEADERS, ETag: `"${convoData.version}"` } });
+    }
+
+    // 2. Perform the update using the user-scoped client. RLS UPDATE policies will apply.
+    const { data: updatedRow, error: updErr } = await supabaseUserClient
+      .from("conversations")
+      .update({
+        is_chatbot_active: body.is_active,
+        version: version + 1, // Increment version
+        updated_at: new Date().toISOString() // Set updated_at
+      })
+      .eq("id", body.conversation_id)
+      .eq("version", version) // Optimistic lock condition
+      .select("id, is_chatbot_active, version") // Select fields to return and confirm update
+      .single(); // Expecting to update one row
+
+    if (updErr) {
+      // PostgREST error P0001 or similar might indicate RLS violation if no rows updated
+      // PGRST204 is "No rows found" - could be RLS violation or optimistic lock failure
+      if (updErr.code === "PGRST204" || updErr.details?.includes('0 rows')) {
+        logger("optimistic_lock_failed_or_rls_update_denied", { conversationId: body.conversation_id, versionAttempted: version, currentVersionInDb: convoData.version, userId: user.id }, "warn");
+        return jsonResponse({ code: "OPTIMISTIC_LOCK_FAILED_OR_FORBIDDEN", message: "Update failed: Conversation may have been updated by another process, or permission denied for update. Please refresh." }, 409); // 409 Conflict
+      }
+      logger("db_update_error", { error: updErr.message, details: updErr, conversationId: body.conversation_id, userId: user.id });
+      return jsonResponse({ code: "DB_UPDATE_ERROR", message: "Failed to update chatbot status: " + updErr.message }, 500);
+    }
+
+    logger("toggle_success", { userId: user.id, conversationId: body.conversation_id, newChatbotState: updatedRow.is_chatbot_active });
+    return jsonResponse(
+      { success: true, message: "Chatbot status updated successfully.", updated_conversation: updatedRow },
+      200,
+      { ETag: `"${updatedRow.version}"` } // Return new ETag
+    );
+
+  } catch (e: any) {
+    logger("unhandled_exception", { error: e?.message ?? e, stack: e?.stack, conversationId: body.conversation_id });
+    return jsonResponse({ code: "UNEXPECTED_ERROR", message: "An unexpected server error occurred." }, 500);
+  }
+});

@@ -1,0 +1,140 @@
+// supabase/functions/initiate-bulk-send/index.ts
+// deno-lint-ignore-file no-explicit-any
+// Edge Function – initiate‑bulk‑send (v1.3)
+// POST /initiate-bulk-send  (JSON body)
+// * Admin‑only action; validates payload (< 1 MB) and invokes SQL RPC.
+// * Relies on DB Webhook on message_queue to kick bulk-send-processor.
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
+import { log, LogLevel } from "../_shared/log.ts"; // Ensure this path is correct
+
+// ENV -----------------------------------------------------------------
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const PUBLIC_ANON_KEY     = Deno.env.get("SUPABASE_ANON_KEY");
+if (!SUPABASE_URL || !PUBLIC_ANON_KEY) throw new Error("Missing Supabase env vars: SUPABASE_URL, PUBLIC_ANON_KEY");
+
+// Helpers --------------------------------------------------------------
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*", // Consider restricting in production
+  "Access-Control-Allow-Methods": "POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization,Content-Type",
+};
+const jsonResponse = (body: unknown, status = 200, extraHeaders: Record<string,string> = {}) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...extraHeaders },
+  });
+
+// Validation -----------------------------------------------------------
+const RecipientSchema = z.object({
+  // Regex now requires '+' prefix to match SQL function's stricter validation
+  recipient_e164_phone: z.string().regex(/^\+[1-9]\d{7,14}$/, {message: "recipient_e164_phone must be a valid E.164 number starting with '+'."}),
+  template_variables_used: z.record(z.any()).nullish(),
+  image_url: z.string().url({message: "Invalid image_url format."}).nullish(),
+});
+const InitiateBulkSendPayloadSchema = z.object({
+  campaign_name: z.string().trim().max(255, {message: "Campaign name cannot exceed 255 characters."}).optional(),
+  template_id: z.string().uuid({message: "template_id must be a valid UUID."}),
+  business_whatsapp_number_id: z.string().uuid({message: "business_whatsapp_number_id must be a valid UUID."}),
+  recipients_data: z.array(RecipientSchema).min(1, {message: "recipients_data array must contain at least one recipient."}),
+});
+
+type InitiateBulkSendBody = z.infer<typeof InitiateBulkSendPayloadSchema>;
+
+// Handler --------------------------------------------------------------
+serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: CORS_HEADERS });
+  }
+  const functionName = "initiate-bulk-send";
+  const reqId = crypto.randomUUID();
+  const logger = (evt: string, extra: Record<string, unknown> = {}, lvl: LogLevel = "info") =>
+    log(evt, { fn: functionName, reqId, ...extra }, { level: lvl });
+
+  if (req.method !== "POST") {
+    logger("method_not_allowed", { method: req.method }, "warn");
+    return jsonResponse({ code: "METHOD_NOT_ALLOWED", message: "Method must be POST." }, 405);
+  }
+
+  // Hard limit 1 MB payload
+  const contentLength = Number(req.headers.get("content-length") || "0");
+  if (contentLength > 1_000_000) { // 1MB
+    logger("payload_too_large", { size: contentLength }, "warn");
+    return jsonResponse({ code: "PAYLOAD_TOO_LARGE", message: "Request payload exceeds maximum size of 1MB." }, 413);
+  }
+
+  let body: InitiateBulkSendBody;
+  try {
+    const rawJson = await req.json();
+    // Client-side deduplication of recipients before Zod parsing
+    if (rawJson.recipients_data && Array.isArray(rawJson.recipients_data)) {
+        rawJson.recipients_data = Array.from(
+            new Map(rawJson.recipients_data.map((r: any) => [r.recipient_e164_phone, r])).values()
+        );
+    }
+    const parsed = InitiateBulkSendPayloadSchema.safeParse(rawJson);
+    if (!parsed.success) {
+      logger("bad_request_validation", { issues: parsed.error.flatten() }, "warn");
+      return jsonResponse({ code: "BAD_REQUEST", message: "Invalid payload.", details: parsed.error.flatten() }, 400);
+    }
+    body = parsed.data;
+  } catch (e) {
+    logger("bad_request_json_parse", { error: e?.message }, "warn");
+    return jsonResponse({ code: "BAD_REQUEST", message: "Invalid JSON payload." }, 400);
+  }
+
+  // Auth --------------------------------------------------------------
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) {
+    logger("auth_header_missing", {}, "warn");
+    return jsonResponse({ code: "AUTH_REQUIRED", message: "Missing Authorization header." }, 401);
+  }
+
+  const supabaseUserClient: SupabaseClient = createClient(
+    SUPABASE_URL!, // Null check done at the top
+    PUBLIC_ANON_KEY!, // Null check done at the top
+    { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false, autoRefreshToken: false } },
+  );
+
+  const { data: { user: actor }, error: authErr } = await supabaseUserClient.auth.getUser();
+  if (authErr || !actor) {
+    logger("auth_invalid_session", { error: authErr?.message }, "warn");
+    return jsonResponse({ code: "AUTH_INVALID", message: authErr?.message ?? "Invalid or expired session." }, 401);
+  }
+
+  const actorRole = (actor as any).app_metadata?.role ?? "user";
+  if (actorRole !== "admin") {
+    logger("auth_forbidden_not_admin", { userId: actor.id, role: actorRole }, "warn");
+    return jsonResponse({ code: "FORBIDDEN_ROLE", message: "Only Admins can initiate bulk send campaigns." }, 403);
+  }
+
+  // RPC ---------------------------------------------------------------
+  try {
+    logger("rpc_call_attempt", { rpc: "initiate_bulk_send_campaign", actorId: actor.id, campaignName: body.campaign_name });
+
+    const { data: rpcResult, error: rpcErr } = await supabaseUserClient.rpc("initiate_bulk_send_campaign", {
+      p_admin_user_id: actor.id,
+      p_campaign_name: body.campaign_name,
+      p_template_id: body.template_id,
+      p_business_whatsapp_number_id: body.business_whatsapp_number_id,
+      p_recipients_data: body.recipients_data, // Already deduplicated client-side
+    });
+
+    if (rpcErr) {
+      const httpStatus = Number(rpcErr.hint) || 500;
+      logger("rpc_call_failed", { error: rpcErr.message, code: rpcErr.code, details: rpcErr.details, hint: rpcErr.hint }, httpStatus >= 500 ? "error" : "warn");
+      return jsonResponse({ code: rpcErr.code ?? "RPC_ERROR", message: rpcErr.message, details: rpcErr.details }, httpStatus);
+    }
+
+    logger("rpc_call_success", { result: rpcResult });
+    // The Supabase Database Webhook on message_queue inserts will kick the processor.
+
+    return jsonResponse({ success: true, message: "Bulk send campaign initiated successfully. Messages are being queued.", data: rpcResult });
+
+  } catch (e: any) {
+    logger("unhandled_exception", { error: e?.message ?? e, stack: e?.stack });
+    return jsonResponse({ code: "UNEXPECTED_ERROR", message: "An unexpected server error occurred." }, 500);
+  }
+});

@@ -1,0 +1,71 @@
+// deno-lint-ignore-file no-explicit-any
+import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+// import type { Database } from "@/types/supabase";   // ← uncomment after generating types
+
+/* ──────────────────────────────────────────────
+ * 1.  Initialise the admin client (crash-early)
+ * ──────────────────────────────────────────── */
+const SUPABASE_URL     = Deno.env.get("SUPABASE_URL");
+const SERVICE_ROLE_KEY = Deno.env.get("CUSTOM_SERVICE_ROLE_KEY");
+
+if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+  throw new Error("Missing SUPABASE_URL or CUSTOM_SERVICE_ROLE_KEY env vars");
+}
+
+// const supabase: SupabaseClient<Database> = …
+const supabase: SupabaseClient = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+  auth:   { persistSession: false, autoRefreshToken: false },
+  global: { headers: { "x-supabase-admin": "true" } }, // bypass future RLS
+});
+
+/* ──────────────────────────────────────────────
+ * 2.  Structured JSON logger
+ * ──────────────────────────────────────────── */
+function log(evt: string, extra: Record<string, unknown> = {}) {
+  console.log(JSON.stringify({ evt, ts: new Date().toISOString(), ...extra }));
+}
+
+/* ──────────────────────────────────────────────
+ * 3.  Core handler
+ * ──────────────────────────────────────────── */
+async function resetRateCaps(): Promise<Response> {
+  try {
+    /* Prefer the database clock for a true UTC timestamp */
+    const { data: nowRow, error: timeErr } = await supabase.rpc("select_now_utc"); 
+    if (timeErr || !nowRow) throw timeErr ?? new Error("Could not fetch UTC time");
+    const nowIso: string = nowRow as string;               // RPC returns TEXT ISO-8601
+
+    const { error, count } = await supabase
+      .from("business_whatsapp_numbers")
+      .update(
+        {
+          is_rate_capped_today: false,
+          mps_target_updated_at: nowIso,                    // reset probe-timer
+        },
+        { returning: "minimal" }                            // fastest path
+      )
+      .eq("is_rate_capped_today", true)
+      .throwOnError();
+
+    log("cap_reset", { rowsChanged: count ?? 0 });
+
+    /* Optional: persist run metadata for dashboards
+       await supabase.rpc("record_edge_fn_run", {
+         fn_name:   "daily_cap_reset",
+         row_count: count ?? 0,
+         ran_at:    nowIso
+       });
+    */
+
+    return new Response("ok");                              // 200
+  } catch (e: any) {
+    log("cap_reset_error", { error: e?.message ?? e });
+    return new Response("error", { status: 500 });          // surfaces error to cron monitor
+  }
+}
+
+/* ──────────────────────────────────────────────
+ * 4.  Start the Edge Function
+ * ──────────────────────────────────────────── */
+serve(resetRateCaps);

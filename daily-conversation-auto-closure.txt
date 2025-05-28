@@ -1,0 +1,63 @@
+// supabase/functions/daily-conversation-auto-closure/index.ts
+// deno-lint-ignore-file no-explicit-any
+import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+/* =============================================================================
+ * 0. Config ─ inactivity window (hours) comes from an env var or defaults to 24
+ * ============================================================================= */
+const AUTO_CLOSE_HOURS = Number(Deno.env.get("AUTO_CLOSE_HOURS") ?? "24");
+
+/* =============================================================================
+ * 1. Bootstrap admin client (crash-early on mis-config)
+ * ============================================================================= */
+const SUPABASE_URL       = Deno.env.get("SUPABASE_URL");
+const SERVICE_ROLE_KEY   = Deno.env.get("CUSTOM_SERVICE_ROLE_KEY");
+
+if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+  throw new Error("Missing SUPABASE_URL or CUSTOM_SERVICE_ROLE_KEY env vars");
+}
+
+const supabase: SupabaseClient = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+  auth:    { persistSession: false, autoRefreshToken: false },
+  global: { headers: { "x-supabase-admin": "true" } },
+});
+
+/* =============================================================================
+ * 2. Structured JSON logger
+ * ============================================================================= */
+function log(evt: string, extra: Record<string, unknown> = {}) {
+  console.log(JSON.stringify({
+    evt,
+    fn: "daily-conversation-auto-closure",
+    ts: new Date().toISOString(),
+    ...extra,
+  }));
+}
+
+/* =============================================================================
+ * 3. Core handler (now calls the PL/pgSQL function)
+ * ============================================================================= */
+async function autoCloseViaRpc(): Promise<Response> {
+  log("invoke_rpc");
+
+  try {
+    const { data: closedCount, error: rpcError } = await supabase
+      .rpc('close_idle_conversations', { p_hours: AUTO_CLOSE_HOURS });
+
+    if (rpcError) throw rpcError;
+
+    log("success_rpc", { closed: closedCount ?? 0 });
+    return new Response("ok"); // 200
+
+  } catch (e: any) {
+    log("error_rpc", { msg: e?.message ?? e, details: e });
+    return new Response("error", { status: 500 }); // visible to Cron monitor
+  }
+}
+
+/* =============================================================================
+ * 4. Start the Edge Function
+ * ============================================================================= */
+serve(autoCloseViaRpc);
+

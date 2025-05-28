@@ -1,0 +1,122 @@
+// deno-lint-ignore-file no-explicit-any
+// Edge Function – sync-templates  (v1.1)
+// GET /sync-templates?waba_id=<WABA_ID>
+//
+// • Admin-only.
+// • Fetches *all* templates from WhatsApp Graph, paging until done.
+// • Upserts into message_templates_cache (unique on waba_id+name+language).
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { log } from "../_shared/log.ts";
+
+/* ─── Env ─────────────────────────────────────────── */
+const SUPA_URL  = Deno.env.get("SUPABASE_URL");
+const ANON_KEY  = Deno.env.get("SUPABASE_ANON_KEY");
+const SERVICE_KEY = Deno.env.get("CUSTOM_SERVICE_ROLE_KEY");
+const FALLBACK_WABA_ID = Deno.env.get("DEFAULT_WABA_ID");
+const GLOBAL_TOKEN     = Deno.env.get("WHATSAPP_API_TOKEN");
+const GRAPH_VER        = Deno.env.get("WA_GRAPH_VERSION") ?? "v19.0";
+if (!SUPA_URL || !ANON_KEY || !SERVICE_KEY) throw new Error("Missing Supabase env vars");
+
+/* ─── Helpers ─────────────────────────────────────── */
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization,Content-Type",
+};
+const json = (b: unknown, s = 200) =>
+  new Response(JSON.stringify(b), { status: s, headers: { ...CORS, "Content-Type": "application/json" } });
+
+/* ─── Handler ─────────────────────────────────────── */
+serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
+
+  const fn = "sync-templates";
+  const reqId = crypto.randomUUID();
+  const logger = (e: string, ex: Record<string, unknown> = {}, lvl: "info" | "warn" | "error" = "info") =>
+    log(e, { fn, reqId, ...ex }, { level: lvl });
+
+  if (req.method !== "GET") return json({ code: "METHOD_NOT_ALLOWED" }, 405);
+
+  /* query param */
+  const url = new URL(req.url);
+  const targetWabaId = url.searchParams.get("waba_id") ?? FALLBACK_WABA_ID;
+  if (!targetWabaId) return json({ code: "WABA_ID_REQUIRED" }, 400);
+
+  /* auth */
+  const auth = req.headers.get("Authorization");
+  if (!auth) return json({ code: "AUTH_REQUIRED" }, 401);
+
+  const userClient = createClient(SUPA_URL, ANON_KEY, {
+    global: { headers: { Authorization: auth } },
+    auth: { persistSession: false },
+  });
+  const { data: { user }, error: authErr } = await userClient.auth.getUser();
+  if (authErr || !user) return json({ code: "AUTH_INVALID" }, 401);
+
+  const { data: roleRow } = await createClient(SUPA_URL, SERVICE_KEY).from("profile")
+    .select("role")
+    .eq("id", user.id)
+    .single();
+  if (roleRow?.role !== "admin") return json({ code: "FORBIDDEN_ROLE" }, 403);
+
+  /* token lookup – try user-visible row first */
+  let token = GLOBAL_TOKEN ?? null;
+  const { data: tokRow } = await userClient.from("business_whatsapp_numbers")
+    .select("access_token")
+    .eq("waba_id", targetWabaId)
+    .eq("is_active", true)
+    .limit(1)
+    .maybeSingle();
+
+  if (tokRow?.access_token) token = tokRow.access_token;
+  if (!token) return json({ code: "API_TOKEN_MISSING" }, 500);
+
+  /* fetch templates with pagination */
+  logger("fetch_start", { wabaId: targetWabaId });
+  const templates: any[] = [];
+  let api = `https://graph.facebook.com/${GRAPH_VER}/${targetWabaId}/message_templates?fields=name,language,category,components,status&limit=250`;
+
+  for (let tries = 0; api; ) {
+    const res = await fetch(api, { headers: { Authorization: `Bearer ${token}` } });
+    const j = await res.json();
+
+    if (res.status === 429 || j.error?.code === 80007) {         // Meta rate cap
+      if (++tries > 3) return json({ code: "WA_RATE_LIMIT" }, 429);
+      const wait = Number(res.headers.get("retry-after") ?? "15") * 1_000;
+      await new Promise(r => setTimeout(r, wait));
+      continue;
+    }
+    if (!res.ok) return json({ code: "WHATSAPP_ERROR", details: j.error }, 502);
+
+    templates.push(...(j.data ?? []));
+    api = j.paging?.next ?? null;
+  }
+
+  if (!templates.length) return json({ success: true, synced: 0, message: "No templates on WABA." });
+
+  /* upsert */
+  const rows = templates.map(t => ({
+    waba_id: targetWabaId,
+    name: t.name,
+    language: t.language,
+    category: t.category,
+    components_json: JSON.stringify(t.components ?? []),
+    status_from_whatsapp: t.status,
+    last_synced_at: new Date().toISOString(),
+  }));
+
+  const adminClient = createClient(SUPA_URL, SERVICE_KEY, { auth: { persistSession: false } });
+  const { error } = await adminClient
+    .from("message_templates_cache")
+    .upsert(rows, { onConflict: "waba_id,name,language", ignoreDuplicates: false });
+
+  if (error) {
+    logger("upsert_fail", { error: error.message }, "error");
+    return json({ code: "DB_ERROR", message: error.message }, 500);
+  }
+
+  logger("fetch_done", { wabaId: targetWabaId, count: rows.length });
+  return json({ success: true, synced: rows.length });
+});
