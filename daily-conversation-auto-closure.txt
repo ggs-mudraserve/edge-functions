@@ -1,63 +1,78 @@
 // supabase/functions/daily-conversation-auto-closure/index.ts
-// deno-lint-ignore-file no-explicit-any
-import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
-import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+// Edge Function v1.3 — quick-win hardened
 
-/* =============================================================================
- * 0. Config ─ inactivity window (hours) comes from an env var or defaults to 24
- * ============================================================================= */
-const AUTO_CLOSE_HOURS = Number(Deno.env.get("AUTO_CLOSE_HOURS") ?? "24");
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-/* =============================================================================
- * 1. Bootstrap admin client (crash-early on mis-config)
- * ============================================================================= */
-const SUPABASE_URL       = Deno.env.get("SUPABASE_URL");
-const SERVICE_ROLE_KEY   = Deno.env.get("CUSTOM_SERVICE_ROLE_KEY");
+/* ── env ── */
+const { SUPABASE_URL, CUSTOM_SERVICE_ROLE_KEY, SYSTEM_USER_ID } = Deno.env.toObject();
+const H = Math.min(Math.max(Number(Deno.env.get("AUTO_CLOSE_HOURS") ?? "24"), 1), 168); // clamp 1-168
+if (!SUPABASE_URL || !CUSTOM_SERVICE_ROLE_KEY) throw new Error("Missing SUPABASE env vars");
 
-if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
-  throw new Error("Missing SUPABASE_URL or CUSTOM_SERVICE_ROLE_KEY env vars");
-}
+/* ── logger fallback ── */
+let sharedLog: (e:string,x?:Record<string,unknown>,o?:{level:string})=>void = console.log;
+try { ({ log: sharedLog } = await import("../_shared/log.ts")); } catch { /* fallback stays */ }
 
-const supabase: SupabaseClient = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
-  auth:    { persistSession: false, autoRefreshToken: false },
-  global: { headers: { "x-supabase-admin": "true" } },
+/* ── clients ── */
+const sb = createClient(SUPABASE_URL!, CUSTOM_SERVICE_ROLE_KEY!, {
+  auth:{persistSession:false,autoRefreshToken:false},
 });
 
-/* =============================================================================
- * 2. Structured JSON logger
- * ============================================================================= */
-function log(evt: string, extra: Record<string, unknown> = {}) {
-  console.log(JSON.stringify({
-    evt,
-    fn: "daily-conversation-auto-closure",
-    ts: new Date().toISOString(),
-    ...extra,
-  }));
-}
+/* ── helper ── */
+const json = (body:unknown,status=200)=>
+  new Response(JSON.stringify(body),{ status,
+    headers:{ "Content-Type":"application/json" }});
 
-/* =============================================================================
- * 3. Core handler (now calls the PL/pgSQL function)
- * ============================================================================= */
-async function autoCloseViaRpc(): Promise<Response> {
-  log("invoke_rpc");
+/* ── main ── */
+serve(async ()=> {
+  const t0 = performance.now();
+  const logCtx = { fn:"daily-conversation-auto-closure", hour_window:H };
 
-  try {
-    const { data: closedCount, error: rpcError } = await supabase
-      .rpc('close_idle_conversations', { p_hours: AUTO_CLOSE_HOURS });
+  sharedLog("start", logCtx);
 
-    if (rpcError) throw rpcError;
+  /* RPC: close idle conversations */
+  const { data, error } = await sb.rpc("close_idle_conversations",
+      { p_hours: H }, { signal: AbortSignal.timeout(25_000) });
 
-    log("success_rpc", { closed: closedCount ?? 0 });
-    return new Response("ok"); // 200
-
-  } catch (e: any) {
-    log("error_rpc", { msg: e?.message ?? e, details: e });
-    return new Response("error", { status: 500 }); // visible to Cron monitor
+  if (error) {
+    sharedLog("rpc_error", { ...logCtx, err:error.message }, { level:"error" });
+    return json({ success:false, error:error.message }, 500);
   }
-}
 
-/* =============================================================================
- * 4. Start the Edge Function
- * ============================================================================= */
-serve(autoCloseViaRpc);
+  const closedIds: string[] = (data as any)?.closed_ids ?? [];
+  const count: number       = (data as any)?.actual_closed_count ?? closedIds.length;
 
+  sharedLog("rpc_success", { ...logCtx, count });
+
+  /* Nothing closed → early exit */
+  if (count === 0) {
+    const took = Math.round(performance.now() - t0);
+    return json({ success:true, closed:0, took_ms:took }, 202);
+  }
+
+  /* log system messages if SYSTEM_USER_ID present */
+  if (!SYSTEM_USER_ID) {
+    sharedLog("system_user_missing", logCtx, { level:"warn" });
+  } else {
+    let ok = 0;
+    for (const convoId of closedIds) {
+      const { error:insErr } = await sb.rpc("insert_message", {
+        p_conversation_id:   convoId,
+        p_content_type:      "text",
+        p_sender_type:       "system",
+        p_text_content:      "This conversation was automatically closed due to inactivity.",
+        p_template_name:     null,
+        p_template_variables:null,
+        p_media_url:         null,
+        p_whatsapp_message_id: crypto.randomUUID(),        // idempotent placeholder
+        p_sender_id_override: SYSTEM_USER_ID
+      });
+      if (!insErr) ok++;
+      else sharedLog("msg_insert_fail",{ convoId, err:insErr.message },{level:"error"});
+    }
+    sharedLog("system_log_summary",{ ...logCtx, ok, attempted:closedIds.length });
+  }
+
+  const took = Math.round(performance.now() - t0);
+  return json({ success:true, closed:count, took_ms:took }, 202);
+});

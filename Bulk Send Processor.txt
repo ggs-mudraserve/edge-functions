@@ -1,99 +1,205 @@
 // supabase/functions/bulk-send-processor/index.ts
-// v1.2-hot-fix-B  ⟶  470 permanent failure, no rate-cap, no retry
+// Edge Function – bulk-send-processor (v1.3.2)
+// • Fixes parameter names for conversation RPC
+// • Uses business_whatsapp_number_id consistently
+// • Handles WA success-without-ID edge-case
+// • Minor import cleanup
 
-import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
-import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { callWhatsAppApi, log as sharedLog } from "../_shared/wa.ts";
 
-/*──────── configuration ────────*/
-const MAX_MESSAGES_PER_INVOCATION = 50;
-const MAX_RETRIES                 = 3;
-const RETRY_BACKOFF_SECONDS       = [15, 60, 300];   // 15 s → 5 min
+/* ───── ENV ───── */
+const { SUPABASE_URL, CUSTOM_SERVICE_ROLE_KEY, SYSTEM_USER_ID } = Deno.env.toObject();
+if (!SUPABASE_URL || !CUSTOM_SERVICE_ROLE_KEY || !SYSTEM_USER_ID) {
+  throw new Error("Missing SUPABASE_URL / CUSTOM_SERVICE_ROLE_KEY / SYSTEM_USER_ID");
+}
 
-const RATE_LIMIT_ERROR_CODE_WHATSAPP = [429, 471 /* , 80007 */]; // ← 470 REMOVED
-const PERMANENT_TEMPLATE_ERROR_CODE  = 470;                     // NEW
+/* ───── constants ───── */
+const BATCH_SIZE = 20;
+const MAX_RETRIES = 3;
+const RETRY_BACKOFF_S = [60, 300, 1800];
+const RATE_LIMIT_CODES = new Set([429, 471, 80007, 131047, 80004, 20]);
+const PERM_TEMPLATE_ERR = 470;
 
-const WA_GRAPH_VERSION_BSP = Deno.env.get("WA_GRAPH_VERSION") ?? "v19.0";
+/* ───── Supabase admin client ───── */
+const sbAdmin = createClient(SUPABASE_URL, CUSTOM_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+const abort = (ms = 25_000) => ({ signal: AbortSignal.timeout(ms) });
 
-/* … helper functions & sendWhatsAppMessage (unchanged from previous patch)
-      remember: sendWhatsAppMessage now accepts per-number token + idempotency key …
-*/
+/* ───── logger factory ───── */
+const fn = "bulk-send-processor";
+const makeLogger = (runId: string) => (evt: string, x: Record<string, unknown> = {}, lvl: "info" | "warn" | "error" = "info") =>
+  sharedLog(evt, { fn, run_id: runId, ...x }, { level: lvl });
 
-/*──────── main handler ────────*/
-serve(async (req) => {
-  /* … unchanged boiler-plate … */
+/* ───── WA result type ───── */
+interface WAOk { success: true; message_id: string }
+interface WAErr { success: false; error_code?: number; error_message?: string; error_details?: unknown }
+type WARes = WAOk | WAErr;
 
-  for (const [bizNumId, batch] of messagesByBusinessNumber.entries()) {
-    /* … fetch & compute mpsTarget exactly as before … */
+/* ───── HTTP helper ───── */
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, Apikey",
+  "Access-Control-Max-Age": "600",
+};
+const respond = (code: string, status = 200, extra?: Record<string, unknown>) =>
+  new Response(JSON.stringify({ success: status < 400, code, ...extra }), { status, headers: { ...CORS, "Content-Type": "application/json" } });
 
-    let rateLimitHit = false;
+/* ───── Interface for fetched row ───── */
+interface QueueItem {
+  id: string;
+  recipient_e164_phone: string;
+  template_variables_used: Record<string, any> | null;
+  image_url: string | null;
+  attempt_count: number;
+  created_at: string;
+  bulk_send_id: string;
+  bulk_sends: {
+    message_templates_cache: { name: string; language: string; components_json: any } | null;
+    business_whatsapp_number_id: string;
+    business_whatsapp_numbers: { waba_phone_number_id: string; access_token: string; segment: string } | null;
+  } | null;
+}
 
-    for (const msg of batch.slice(0, maxToSendThisCycle)) {
-      if (rateLimitHit) break;
+/* ───── Main handler ───── */
+serve(async () => {
+  const runId = crypto.randomUUID().slice(0, 8);
+  const log = makeLogger(runId);
+  const started = performance.now();
+  log("run_start", { batch: BATCH_SIZE });
 
-      /* mark “processing” exactly as before */
+  /* 1. fetch queue */
+  const { data, error: qErr } = await sbAdmin
+    .from("message_queue")
+    .select(`id, recipient_e164_phone, template_variables_used, image_url, attempt_count, created_at, bulk_send_id,
+             bulk_sends!inner(message_templates_cache!inner(name,language,components_json), business_whatsapp_number_id,
+               business_whatsapp_numbers!inner(waba_phone_number_id,access_token,segment))`)
+    .in("status", ["pending", "retry_queued"])
+    .lte("next_attempt_at", new Date().toISOString())
+    .order("created_at")
+    .limit(BATCH_SIZE);
 
-      const result = await sendWhatsAppMessage(
-        msg.waba_phone_number_id_to_send_from!,
-        msg.recipient_e164_phone,
-        msg.template_name!,
-        msg.template_language!,
-        msg.template_components_json || [],
-        msg.template_variables_used,
-        msg.image_url,
-        (msg as any).bulk_sends.business_whatsapp_numbers.access_token      // per-number token
-      );
-
-      if (result.success && result.message_id) {
-        /* … success branch unchanged … */
-        continue;
-      }
-
-      /*──────── FAILURE handling ────────*/
-      const code = result.error_code ?? 0;
-      const age  = (Date.now() - Date.parse(msg.created_at)) / 1000;
-
-      if (code === PERMANENT_TEMPLATE_ERROR_CODE) {          // NEW  ➜ permanent
-        const reason = `Template mismatch (470): ${result.error_message}`;
-        await supabase.from("bulk_send_details").upsert({
-          bulk_send_id          : msg.bulk_send_id,
-          mobile_number_e164    : msg.recipient_e164_phone,
-          status                : "failed",
-          failure_reason        : reason,
-          whatsapp_message_id   : null
-        }, { onConflict: "bulk_send_id, mobile_number_e164" });
-
-        await supabase.from("message_queue").delete().eq("id", msg.id);
-        console.warn(`[Processor] Permanent 470 failure for ${msg.id}: ${reason}`);
-        continue;                                           // NO retry, NO rate-cap
-      }
-
-      const isRateLimit = RATE_LIMIT_ERROR_CODE_WHATSAPP.includes(code);
-      const canRetry    = !isRateLimit && age < 86_400 && msg.attempt_count < MAX_RETRIES;
-
-      if (canRetry) {
-        /* … re-queue exactly as in previous patch … */
-      } else {
-        const reason = isRateLimit
-          ? `Rate-limit (${code}) after ${msg.attempt_count+1} attempts`
-          : `Permanent failure after retries: ${result.error_message}`;
-        await supabase.from("bulk_send_details").upsert({
-          bulk_send_id: msg.bulk_send_id,
-          mobile_number_e164: msg.recipient_e164_phone,
-          status: "failed",
-          failure_reason: reason,
-          whatsapp_message_id: null
-        }, { onConflict: "bulk_send_id, mobile_number_e164" });
-        await supabase.from("message_queue").delete().eq("id", msg.id);
-      }
-
-      if (isRateLimit) {
-        rateLimitHit = true;
-        /* … existing rate-capping logic unchanged … */
-      }
-    }
-
-    /* … adaptive MPS increase (unchanged) … */
+  if (qErr) {
+    log("queue_fetch_error", { err: qErr.message }, "error");
+    return respond("QUEUE_FETCH_ERROR", 500);
+  }
+  const queue = data as QueueItem[] | null;
+  if (!queue?.length) {
+    log("queue_empty");
+    return respond("NO_WORK", 204);
   }
 
-  /* … response / catch block unchanged … */
+  for (const row of queue) {
+    /* Essential nested data */
+    const tpl = row.bulk_sends?.message_templates_cache;
+    const biz = row.bulk_sends?.business_whatsapp_numbers;
+    const bwnId = row.bulk_sends?.business_whatsapp_number_id;
+    if (!tpl || !biz || !bwnId) {
+      await failPermanent(row, "Missing joined data", log);
+      continue;
+    }
+
+    /* mark processing */
+    await sbAdmin.from("message_queue").update({ status: "processing", last_attempt_at: new Date().toISOString() }).eq("id", row.id);
+
+    /* build WA payload */
+    const origComps = Array.isArray(tpl.components_json) ? tpl.components_json : (tpl.components_json as any)?.components;
+    const comps = buildTemplateComponents(origComps, row.template_variables_used, row.image_url ?? undefined);
+    const payload = { type: "template", template: { name: tpl.name, language: { code: tpl.language }, components: comps?.length ? comps : undefined } };
+
+    /* send to WA */
+    const wa = await callWhatsAppApi({ wabaPhoneId: biz.waba_phone_number_id, token: biz.access_token, idempotencyKey: `q-${row.id}-${row.attempt_count}` }, row.recipient_e164_phone, payload) as WARes;
+    if (!wa.success) { await handleSendFailure(row, wa as WAErr, bwnId, log); continue; }
+
+    const waId = wa.message_id ?? null; // handles success w/o ID edge case
+
+    /* 2. conversation RPC */
+    const { data: convoId, error: convErr } = await sbAdmin.rpc(
+      "get_or_create_conversation_for_contact",
+      {
+        p_recipient_phone_e164: row.recipient_e164_phone,
+        p_business_number_id: bwnId,
+        p_business_segment: biz.segment,
+      }, abort());
+
+    if (convErr || !convoId) { await failPermanent(row, `Conversation RPC error: ${convErr?.message}`, log); continue; }
+
+    /* 3. persist */
+    const { error: insErr } = await sbAdmin.rpc("insert_message", {
+      p_conversation_id: convoId as string,
+      p_content_type: "template",
+      p_sender_type: "system",
+      p_text_content: null,
+      p_template_name: tpl.name,
+      p_template_variables: row.template_variables_used,
+      p_media_url: row.image_url ?? null,
+      p_whatsapp_message_id: waId,
+      p_sender_id_override: SYSTEM_USER_ID,
+    }, abort());
+
+    const failure = insErr ? `DB insert failed: ${insErr.message}`.slice(0, 255) : null;
+
+    await sbAdmin.from("bulk_send_details").upsert({
+      bulk_send_id: row.bulk_send_id,
+      mobile_number_e164: row.recipient_e164_phone,
+      status: "sent",
+      whatsapp_message_id: waId,
+      failure_reason: failure,
+    }, { onConflict: "bulk_send_id,mobile_number_e164" });
+
+    await sbAdmin.from("message_queue").delete().eq("id", row.id);
+    log("processed", { id: row.id, wa_id: waId });
+  }
+
+  log("run_complete", { took_ms: Math.round(performance.now() - started) });
+  return respond("OK", 200, { processed: queue.length });
+
+  /* ───── helper inner functions ───── */
+  async function failPermanent(row: QueueItem, reason: string, logger = log) {
+    logger("permanent_fail", { id: row.id, reason }, "warn");
+    await sbAdmin.from("bulk_send_details").upsert({
+      bulk_send_id: row.bulk_send_id,
+      mobile_number_e164: row.recipient_e164_phone,
+      status: "failed",
+      failure_reason: reason.slice(0, 255),
+    }, { onConflict: "bulk_send_id,mobile_number_e164" });
+    await sbAdmin.from("message_queue").delete().eq("id", row.id);
+  }
+
+  async function handleSendFailure(row: QueueItem, waErr: WAErr, businessNumberId: string, logger = log) {
+    if (waErr.error_code === PERM_TEMPLATE_ERR) { await failPermanent(row, `Template error ${waErr.error_code}`); return; }
+    if (RATE_LIMIT_CODES.has(waErr.error_code ?? 0)) {
+      logger("rate_limit", { id: row.id, code: waErr.error_code }, "warn");
+      await sbAdmin.from("business_whatsapp_numbers").update({ is_rate_capped_today: true }).eq("id", businessNumberId);
+    }
+    if (row.attempt_count >= MAX_RETRIES) { await failPermanent(row, `Retries exhausted (${waErr.error_code})`); return; }
+    const nextAttempt = (row.attempt_count || 0) + 1;
+    const backoff = RETRY_BACKOFF_S[row.attempt_count] ?? RETRY_BACKOFF_S.at(-1)!;
+    await sbAdmin.from("message_queue").update({
+      status: "retry_queued",
+      attempt_count: nextAttempt,
+      next_attempt_at: new Date(Date.now() + backoff * 1000).toISOString(),
+    }).eq("id", row.id);
+  }
 });
+
+/* ───── component helper (minimal) ───── */
+function buildTemplateComponents(orig: any[] | undefined, vars: any, header?: string) {
+  if (!orig?.length) {
+    if (!header && !vars?.body) return undefined;
+    const c: any[] = [];
+    if (header) c.push({ type: "HEADER", parameters: [{ type: "image", image: { link: header } }] });
+    if (vars?.body) c.push({ type: "BODY", parameters: vars.body.map((v: any) => ({ type: "text", text: String(v.text ?? v) })) });
+    return c;
+  }
+  return orig.map((comp) => {
+    const copy = { ...comp };
+    if (copy.type === "HEADER" && copy.format === "IMAGE" && header) copy.parameters = [{ type: "image", image: { link: header } }];
+    if (copy.type === "BODY" && vars?.body) copy.parameters = vars.body.map((v: any) => ({ type: "text", text: String(v.text ?? v) }));
+    if (copy.example) delete copy.example;
+    return copy;
+  });
+}
