@@ -1,6 +1,7 @@
 // supabase/functions/send-message/index.ts
-// Edge Function – send-message (v1.6.1)
-// • Header image for templates is persisted via p_media_url
+// Edge Function – send-message (v1.6.2)
+// • buildTemplateComponents now matches the implementation used in bulk-send-processor
+//   (header images, body variables, safe copy, example strip)
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -14,7 +15,7 @@ if (!SUPABASE_URL || !CUSTOM_SERVICE_ROLE_KEY || !SUPABASE_ANON_KEY) {
   throw new Error("Missing env vars");
 }
 const allowedHosts = (ALLOWED_MEDIA_HOSTS || "")
-  .split(",").map(s=>s.trim()).filter(Boolean);
+  .split(",").map(s => s.trim()).filter(Boolean);
 
 /* ───── request schema ───── */
 const Req = z.object({
@@ -151,22 +152,34 @@ serve(async req=>{
     p_template_name:      d.type==="template" ? d.template_name : null,
     p_template_variables: d.type==="template" ? d.template_variables : null,
     p_media_url:          d.type==="template"
-                            ? d.header_image_url ?? null       // ← header image stored here
+                            ? d.header_image_url ?? null
                             : (["image","document"].includes(d.type) ? d.media_url : null),
     p_whatsapp_message_id:wa.message_id,
     p_sender_id_override: null
   });
   if(dbErr) log("db_insert_fail",{err:dbErr.message,waId:wa.message_id},"error");
 
-  return respond("OK",200,{
-    whatsapp_message_id:wa.message_id,
-    database_message_uuid:uuid as string|undefined,
-    warning:dbErr?"db_log_failed":undefined
-  });
+  return respond("OK",200,{ whatsapp_message_id:wa.message_id, database_message_uuid:uuid as string|undefined, warning:dbErr?"db_log_failed":undefined });
 });
 
-/* ───── template helper (unchanged) ───── */
-function buildTemplateComponents( comps:any[]|undefined, vars?:Record<string,any>, header?:string){
-  // (same implementation you already have)
-  return [];
+/* ───── buildTemplateComponents (aligned with bulk-send-processor) ───── */
+function buildTemplateComponents(orig: any[] | undefined, vars?: Record<string, any>, header?: string) {
+  if (!orig?.length) {
+    if (!header && !vars?.body) return undefined;
+    const c: any[] = [];
+    if (header) c.push({ type: "HEADER", parameters: [{ type: "image", image: { link: header } }] });
+    if (vars?.body) c.push({ type: "BODY", parameters: vars.body.map((v: any) => ({ type: "text", text: String(v.text ?? v) })) });
+    return c;
+  }
+  return orig.map((comp) => {
+    const copy = { ...comp };
+    if (copy.type === "HEADER" && copy.format === "IMAGE" && header) {
+      copy.parameters = [{ type: "image", image: { link: header } }];
+    }
+    if (copy.type === "BODY" && vars?.body) {
+      copy.parameters = vars.body.map((v: any) => ({ type: "text", text: String(v.text ?? v) }));
+    }
+    if (copy.example) delete copy.example;
+    return copy;
+  });
 }
